@@ -142,6 +142,28 @@ class DatabasePG:
                 CREATE INDEX IF NOT EXISTS idx_tech_coeff_date ON technical_coefficients(diagnosis_date DESC);
             ''')
 
+            # 7. Таблица замен (журнал ремонта запасных частей)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS replacements (
+                    id SERIAL PRIMARY KEY,
+                    grp_id INTEGER NOT NULL REFERENCES grp(id) ON DELETE CASCADE,
+                    replace_date VARCHAR(255),
+                    part_number VARCHAR(255),
+                    equipment_type VARCHAR(255),
+                    model VARCHAR(255),
+                    manufacturer VARCHAR(255),
+                    work_type VARCHAR(255),
+                    reason TEXT,
+                    supervisor VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_replacements_grp_id ON replacements(grp_id);
+            ''')
+
         print("✅ База данных PostgreSQL инициализирована!")
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ГРП ===
@@ -226,6 +248,13 @@ class DatabasePG:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM equipment WHERE id = %s', (equip_id,))
+
+    def get_all_equipment_names(self) -> List[str]:
+        """Уникальные наименования оборудования по всей БД (для автодополнения)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT DISTINCT name FROM equipment ORDER BY name')
+            return [r[0] for r in cursor.fetchall()]
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ЗАПЧАСТЯМИ (СПРАВОЧНИК) ===
 
@@ -399,3 +428,77 @@ class DatabasePG:
                 ORDER BY diagnosis_date DESC
             ''', (grp_id,))
             return cursor.fetchall()
+
+    # === МЕТОДЫ ДЛЯ РАБОТЫ С ЖУРНАЛОМ ЗАМЕН ===
+
+    def add_replacement(self, grp_id: int, replace_date: str, part_number: str,
+                        equipment_type: str, model: str, manufacturer: str,
+                        work_type: str, reason: str, supervisor: str) -> int:
+        """Добавление записи о замене запасной части."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO replacements
+                (grp_id, replace_date, part_number, equipment_type, model, manufacturer,
+                 work_type, reason, supervisor)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            ''', (grp_id, replace_date, part_number, equipment_type, model, manufacturer,
+                  work_type, reason, supervisor))
+            return cursor.fetchone()[0]
+
+    def update_replacement(self, repl_id: int, replace_date: str, part_number: str,
+                           equipment_type: str, model: str, manufacturer: str,
+                           work_type: str, reason: str, supervisor: str):
+        """Обновление записи о замене запасной части."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE replacements
+                SET replace_date = %s, part_number = %s, equipment_type = %s, model = %s,
+                    manufacturer = %s, work_type = %s, reason = %s, supervisor = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            ''', (replace_date, part_number, equipment_type, model, manufacturer,
+                  work_type, reason, supervisor, repl_id))
+
+    def delete_replacement(self, repl_id: int):
+        """Удаление записи о замене."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM replacements WHERE id = %s', (repl_id,))
+
+    def get_replacements_by_grp(self, grp_id: int) -> List[Tuple]:
+        """Замены по ГРП.
+
+        Кортежи: (id, replace_date, part_number, equipment_type, model,
+        manufacturer, work_type, reason, supervisor)
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, replace_date, part_number, equipment_type, model,
+                       manufacturer, work_type, reason, supervisor
+                FROM replacements
+                WHERE grp_id = %s
+                ORDER BY replace_date NULLS LAST, id
+            ''', (grp_id,))
+            return cursor.fetchall()
+
+    def count_replacements_by_grp(self, grp_id: int) -> int:
+        """Количество замен по ГРП."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM replacements WHERE grp_id = %s', (grp_id,))
+            return cursor.fetchone()[0]
+
+    def get_all_manufacturers(self) -> List[str]:
+        """Уникальные производители из журнала замен (для автодополнения)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DISTINCT manufacturer FROM replacements
+                WHERE manufacturer IS NOT NULL AND manufacturer <> ''
+                ORDER BY manufacturer
+            ''')
+            return [r[0] for r in cursor.fetchall()]
