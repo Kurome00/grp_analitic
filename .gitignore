@@ -1,0 +1,27 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Сборка (PyInstaller)
+build/
+dist/
+*.spec.bak
+
+# Тесты / локальные черновики
+.pytest_cache/
+.coverage
+htmlcov/
+
+# БД / секреты
+*.env
+.env
+.env.local
+
+# ОС / редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

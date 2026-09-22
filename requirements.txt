@@ -1,2 +1,2 @@
-numpy>=1.21.0
-matplotlib>=3.4.0
+﻿psycopg2-binary>=2.9.0
+pdfplumber>=0.11.0
