@@ -20,6 +20,10 @@ htmlcov/
 .env
 .env.local
 
+# Рабочие данные (журнал замен, логи) — не в репозиторий
+data/capture.txt
+data/seed_log.txt
+
 # ОС / редакторы
 .DS_Store
 Thumbs.db

@@ -1,8 +1,8 @@
 import statistics
 from typing import Callable, Dict, List, Optional
 
-from config import EQUIPMENT_NORMS
-from models import Equipment
+from core.config import EQUIPMENT_NORMS
+from core.models import Equipment
 
 
 class StatisticsAnalyzer:

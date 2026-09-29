@@ -4,7 +4,7 @@ from datetime import datetime
 
 import psycopg2
 
-from config import DB_CONFIG
+from core.config import DB_CONFIG, REPLACEABLE_NORM_YEARS, part_norm
 
 
 class DatabasePG:
@@ -88,6 +88,7 @@ class DatabasePG:
                     norm_years DECIMAL(10,2) NOT NULL
                 )
             ''')
+            cursor.execute('ALTER TABLE parts ADD COLUMN IF NOT EXISTS is_replaceable BOOLEAN NOT NULL DEFAULT FALSE')
 
             # 4. Состав оборудования из запчастей
             cursor.execute('''
@@ -96,30 +97,36 @@ class DatabasePG:
                     equipment_id INTEGER NOT NULL REFERENCES equipment(id) ON DELETE CASCADE,
                     part_id INTEGER NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
                     install_date DATE,
-                    removal_date DATE,
-                    UNIQUE (equipment_id, part_id)
+                    removal_date DATE
                 )
+            ''')
+            # Обозначение детали (каталожный номер) у каждой модели своё —
+            # держим его на связи оборудования с деталью.
+            cursor.execute('ALTER TABLE equipment_parts ADD COLUMN IF NOT EXISTS part_number VARCHAR(255)')
+            # История замен: активной может быть только одна запись одной детали.
+            # Снимаем старый UNIQUE в пользу частичного индекса.
+            cursor.execute('''
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'equipment_parts_equipment_id_part_id_key'
+                    ) THEN
+                        ALTER TABLE equipment_parts DROP CONSTRAINT equipment_parts_equipment_id_part_id_key;
+                    END IF;
+                END $$;
+            ''')
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_eqparts_active
+                ON equipment_parts (equipment_id, part_id) WHERE removal_date IS NULL
             ''')
 
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_eqparts_equipment_id ON equipment_parts(equipment_id);
             ''')
+            cursor.execute('DROP TABLE IF EXISTS documentary_norms')
 
-            # 5. Таблица документальных норм
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS documentary_norms (
-                    id SERIAL PRIMARY KEY,
-                    equipment_name VARCHAR(255) NOT NULL UNIQUE,
-                    max_life_years DECIMAL(10,2) NOT NULL,
-                    notes TEXT,
-                    created_date DATE,
-                    updated_date DATE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # 6. Таблица технических коэффициентов
+            # 5. Таблица технических коэффициентов
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS technical_coefficients (
                     id SERIAL PRIMARY KEY,
@@ -258,11 +265,22 @@ class DatabasePG:
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ЗАПЧАСТЯМИ (СПРАВОЧНИК) ===
 
-    def add_part(self, name: str, norm_years: float) -> int:
-        """Добавление типа запчасти"""
+    def add_part(self, name: str, norm_years: float,
+                 is_replaceable: bool = False) -> int:
+        """Добавление типа запчасти.
+
+        norm_years — нормативный срок службы. Если не задан, берётся из
+        config.part_norm(is_replaceable): 5 лет для заменяемой детали,
+        срок полной проверки (20 лет) для остальной.
+        """
+        if norm_years is None:
+            norm_years = part_norm(is_replaceable)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('INSERT INTO parts (name, norm_years) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING RETURNING id', (name, norm_years))
+            cursor.execute(
+                'INSERT INTO parts (name, norm_years, is_replaceable) VALUES (%s, %s, %s) '
+                'ON CONFLICT (name) DO NOTHING RETURNING id',
+                (name, norm_years, is_replaceable))
             row = cursor.fetchone()
             if row:
                 return row[0]
@@ -274,6 +292,49 @@ class DatabasePG:
             cursor = conn.cursor()
             cursor.execute('UPDATE parts SET name = %s, norm_years = %s WHERE id = %s', (name, norm_years, part_id))
 
+    def update_part_norm(self, part_id: int, norm_years: float):
+        """Задать нормативный срок службы детали"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE parts SET norm_years = %s WHERE id = %s',
+                           (norm_years, part_id))
+
+    def align_norms_with_replaceable(self) -> Dict[str, int]:
+        """Миграция норм: заменяемые детали — 5 лет, остальные — 20 лет.
+
+        Прежний дефолт для всех деталей был 5 лет, поэтому норма ровно
+        REPLACEABLE_NORM_YEARS считалась не заданной вручную: она
+        приводится к сроку, который полагается по признаку заменяемости.
+        Значения, не равные ни прежнему дефолту, ни ожидаемому сроку,
+        оставлены как есть. Возвращает счётчики: raise_to / lower_to /
+        manual / ok.
+        """
+        counters = {'raise_to': 0, 'lower_to': 0, 'manual': 0, 'ok': 0}
+        legacy = REPLACEABLE_NORM_YEARS
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, norm_years, is_replaceable FROM parts')
+            rows = cursor.fetchall()
+        for part_id, norm_years, is_replaceable in rows:
+            expected = part_norm(bool(is_replaceable))
+            current = float(norm_years)
+            if abs(current - expected) <= 1e-9:
+                counters['ok'] += 1
+                continue
+            if abs(current - legacy) > 1e-9:
+                counters['manual'] += 1
+                continue
+            self.update_part_norm(part_id, expected)
+            counters['lower_to' if expected < legacy else 'raise_to'] += 1
+        return counters
+
+    def get_part_by_id(self, part_id: int) -> Optional[Tuple]:
+        """Тип запчасти по id (id, name, norm_years, is_replaceable)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, name, norm_years, is_replaceable FROM parts WHERE id = %s', (part_id,))
+            return cursor.fetchone()
+
     def delete_part(self, part_id: int):
         """Удаление типа запчасти (связи удаляются каскадом)"""
         with self.get_connection() as conn:
@@ -281,34 +342,220 @@ class DatabasePG:
             cursor.execute('DELETE FROM parts WHERE id = %s', (part_id,))
 
     def get_all_parts(self) -> List[Tuple]:
-        """Все типы запчастей (id, name, norm_years)"""
+        """Все типы запчастей (id, name, norm_years, is_replaceable)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, name, norm_years FROM parts ORDER BY name')
+            cursor.execute('SELECT id, name, norm_years, is_replaceable FROM parts ORDER BY name')
             return cursor.fetchall()
 
     def get_part_by_name(self, name: str) -> Optional[Tuple]:
-        """Тип запчасти по имени (id, name, norm_years)"""
+        """Тип запчасти по имени (id, name, norm_years, is_replaceable)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, name, norm_years FROM parts WHERE name = %s', (name,))
+            cursor.execute('SELECT id, name, norm_years, is_replaceable FROM parts WHERE name = %s', (name,))
             return cursor.fetchone()
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С СОСТАВОМ ОБОРУДОВАНИЯ ===
 
     def add_equipment_part(self, equipment_id: int, part_id: int,
-                           install_date: str = None, removal_date: str = None) -> int:
-        """Привязка запчасти к оборудованию (при повторе — обновление дат)"""
+                           install_date: str = None, removal_date: str = None,
+                           part_number: str = None) -> int:
+        """Привязка запчасти к оборудованию.
+
+        Активная запись детали может быть только одна (частичный индекс
+        на removal_date IS NULL). При повторном активном связывании —
+        обновление дат. part_number — обозначение (каталожный номер) детали
+        в составе данной модели.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO equipment_parts (equipment_id, part_id, install_date, removal_date)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (equipment_id, part_id)
-                DO UPDATE SET install_date = EXCLUDED.install_date, removal_date = EXCLUDED.removal_date
+                INSERT INTO equipment_parts (equipment_id, part_id, install_date, removal_date, part_number)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (equipment_id, part_id) WHERE removal_date IS NULL
+                DO UPDATE SET install_date = EXCLUDED.install_date, removal_date = EXCLUDED.removal_date,
+                              part_number = EXCLUDED.part_number
                 RETURNING id
-            ''', (equipment_id, part_id, install_date, removal_date))
+            ''', (equipment_id, part_id, install_date, removal_date, part_number))
             return cursor.fetchone()[0]
+
+    def replace_equipment_part(self, equipment_id: int, part_id: int, replace_date: str) -> int:
+        """Физическая замена детали в составе оборудования.
+
+        Отмечает снятие текущей активной записи (removal_date = дата замены)
+        и создаёт новую активную запись той же детали с датой установки =
+        дата замены, перенося обозначение. Возвращает id новой записи.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT ep.id, ep.part_number FROM equipment_parts ep
+                WHERE ep.equipment_id = %s AND ep.part_id = %s AND ep.removal_date IS NULL
+            ''', (equipment_id, part_id))
+            current = cursor.fetchone()
+            if current is None:
+                raise ValueError('Активная запись детали не найдена')
+            old_ep_id, part_number = current
+            cursor.execute(
+                'UPDATE equipment_parts SET removal_date = %s WHERE id = %s',
+                (replace_date, old_ep_id))
+            cursor.execute('''
+                INSERT INTO equipment_parts (equipment_id, part_id, install_date, removal_date, part_number)
+                VALUES (%s, %s, %s, NULL, %s) RETURNING id
+            ''', (equipment_id, part_id, replace_date, part_number))
+            return cursor.fetchone()[0]
+
+    def replace_equipment_completely(self, equipment_id: int, replace_date: str,
+                                     new_name: str = None,
+                                     part_dates: Dict[int, str] = None,
+                                     add_journal: bool = True,
+                                     equipment_type: str = None,
+                                     manufacturer: str = None,
+                                     work_type: str = None,
+                                     reason: str = None,
+                                     supervisor: str = None,
+                                     grp_id: int = None) -> int:
+        """Полная замена оборудования целиком.
+
+        Прежнее оборудование снимается с эксплуатации датой замены, все его
+        активные детали закрываются той же датой. Создаётся новая запись
+        оборудования с датой установки = дата замены, и прежний состав
+        деталей переносится на неё с той же датой установки.
+
+        Из этого следует главное для расчёта: срок службы каждой детали
+        отсчитывается заново от даты замены, а не от даты установки старого
+        оборудования. Для деталей, у которых индивидуальная дата установки
+        отличалась от даты установки оборудования, её можно задать явно через
+        part_dates: {equipment_part_id: 'ДД.ММ.ГГГГ'}; остальные получают дату
+        замены. Если состав деталей нужно оставить прежним — передайте
+        part_dates = None (переносится весь прежний состав).
+
+        Возвращает id новой записи оборудования.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT e.grp_id, e.name, e.install_date::text
+                FROM equipment e WHERE e.id = %s
+            ''', (equipment_id,))
+            current = cursor.fetchone()
+            if current is None:
+                raise ValueError('Оборудование не найдено')
+            old_grp_id, old_name, old_install = current
+
+            if not replace_date:
+                raise ValueError('Не указана дата замены')
+            if old_install and replace_date < old_install:
+                raise ValueError(
+                    f'Дата замены ({replace_date}) раньше даты установки '
+                    f'оборудования ({old_install})')
+
+            # Состав прежних активных деталей: (equipment_part_id, part_id, part_number)
+            cursor.execute('''
+                SELECT ep.id, ep.part_id, ep.part_number
+                FROM equipment_parts ep
+                WHERE ep.equipment_id = %s AND ep.removal_date IS NULL
+                ORDER BY ep.id
+            ''', (equipment_id,))
+            parts = cursor.fetchall()
+
+            # Прежнее оборудование и его детали выводятся из эксплуатации
+            cursor.execute(
+                'UPDATE equipment SET removal_date = %s, updated_at = CURRENT_TIMESTAMP '
+                'WHERE id = %s', (replace_date, equipment_id))
+            cursor.execute(
+                'UPDATE equipment_parts SET removal_date = %s '
+                'WHERE equipment_id = %s AND removal_date IS NULL',
+                (replace_date, equipment_id))
+
+            # Новое оборудование с новой датой установки
+            cursor.execute('''
+                INSERT INTO equipment (grp_id, name, install_date, removal_date)
+                VALUES (%s, %s, %s, NULL) RETURNING id
+            ''', (old_grp_id, new_name or old_name, replace_date))
+            new_equipment_id = cursor.fetchone()[0]
+
+            # Состав переносится с новой датой установки — сроки заново
+            for ep_id, part_id, part_number in parts:
+                part_install = (part_dates or {}).get(ep_id, replace_date)
+                cursor.execute('''
+                    INSERT INTO equipment_parts
+                        (equipment_id, part_id, install_date, removal_date, part_number)
+                    VALUES (%s, %s, %s, NULL, %s)
+                ''', (new_equipment_id, part_id, part_install, part_number))
+
+            if add_journal:
+                cursor.execute('''
+                    INSERT INTO replacements
+                        (grp_id, replace_date, part_number, equipment_type, model,
+                         manufacturer, work_type, reason, supervisor)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (grp_id or old_grp_id, replace_date,
+                      'полная замена оборудования', equipment_type, old_name,
+                      manufacturer, work_type or 'Замена',
+                      reason or 'полная замена оборудования', supervisor))
+            return new_equipment_id
+
+    def get_equipment_parts(self, equipment_id: int) -> List[Tuple]:
+        """Запчасти оборудования.
+
+        (id, part_id, name, norm_years, install_date, removal_date)
+        install_date = None означает 'дата установки оборудования'.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT ep.id, ep.part_id, p.name, p.norm_years, ep.install_date::text, ep.removal_date::text
+                FROM equipment_parts ep
+                JOIN parts p ON p.id = ep.part_id
+                WHERE ep.equipment_id = %s
+                ORDER BY p.name
+            ''', (equipment_id,))
+            return cursor.fetchall()
+
+    def get_equipment_parts_full(self, equipment_id: int) -> List[Tuple]:
+        """Запчасти оборудования с доп. полями.
+
+        (id, part_id, name, norm_years, install_date, removal_date,
+         part_number, is_replaceable)
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT ep.id, ep.part_id, p.name, p.norm_years,
+                       ep.install_date::text, ep.removal_date::text,
+                       ep.part_number, p.is_replaceable
+                FROM equipment_parts ep
+                JOIN parts p ON p.id = ep.part_id
+                WHERE ep.equipment_id = %s
+                ORDER BY p.name, ep.install_date NULLS FIRST, ep.id
+            ''', (equipment_id,))
+            return cursor.fetchall()
+
+    def get_active_replaceable_parts(self, equipment_id: int) -> List[Tuple]:
+        """Активные заменяемые детали оборудования.
+
+        (id, part_id, name, norm_years, part_number, install_date) —
+        кандидаты на замену. install_date = дата последней установки детали
+        (None означает «дата установки оборудования»).
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT ep.id, ep.part_id, p.name, p.norm_years,
+                       ep.part_number, ep.install_date::text
+                FROM equipment_parts ep
+                JOIN parts p ON p.id = ep.part_id
+                WHERE ep.equipment_id = %s AND ep.removal_date IS NULL AND p.is_replaceable
+                ORDER BY p.name
+            ''', (equipment_id,))
+            return cursor.fetchall()
+
+    def update_part_replaceable(self, part_id: int, is_replaceable: bool):
+        """Отметить деталь в справочнике как заменяемую / не заменяемую."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE parts SET is_replaceable = %s WHERE id = %s', (is_replaceable, part_id))
 
     def update_equipment_part(self, ep_id: int, install_date: str = None, removal_date: str = None):
         """Обновление дат запчасти в составе оборудования"""
@@ -332,67 +579,6 @@ class DatabasePG:
                 DELETE FROM equipment_parts
                 WHERE equipment_id IN (SELECT id FROM equipment WHERE grp_id = %s)
             ''', (grp_id,))
-
-    def get_equipment_parts(self, equipment_id: int) -> List[Tuple]:
-        """Запчасти оборудования.
-
-        (id, part_id, name, norm_years, install_date, removal_date)
-        install_date = None означает 'дата установки оборудования'.
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT ep.id, ep.part_id, p.name, p.norm_years, ep.install_date::text, ep.removal_date::text
-                FROM equipment_parts ep
-                JOIN parts p ON p.id = ep.part_id
-                WHERE ep.equipment_id = %s
-                ORDER BY p.name
-            ''', (equipment_id,))
-            return cursor.fetchall()
-
-    # === МЕТОДЫ ДЛЯ РАБОТЫ С ДОКУМЕНТАЛЬНЫМИ НОРМАМИ ===
-
-    def get_all_norms(self) -> List[Tuple]:
-        """Получение всех норм (id, equipment_name, max_life_years, notes)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, equipment_name, max_life_years, notes FROM documentary_norms ORDER BY equipment_name')
-            return cursor.fetchall()
-
-    def get_norm_by_name(self, equipment_name: str) -> Optional[Tuple]:
-        """Получение нормы по имени"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT id, equipment_name, max_life_years, notes FROM documentary_norms WHERE equipment_name = %s',
-                (equipment_name,)
-            )
-            return cursor.fetchone()
-
-    def add_norm(self, equipment_name: str, max_life_years: float, notes: str = ''):
-        """Добавление нормы"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO documentary_norms (equipment_name, max_life_years, notes, created_date, updated_date)
-                VALUES (%s, %s, %s, %s, %s)
-            ''', (equipment_name, max_life_years, notes, datetime.now().date(), datetime.now().date()))
-
-    def update_norm(self, norm_id: int, equipment_name: str, max_life_years: float, notes: str = ''):
-        """Обновление нормы"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE documentary_norms
-                SET equipment_name = %s, max_life_years = %s, notes = %s, updated_date = %s, updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            ''', (equipment_name, max_life_years, notes, datetime.now().date(), norm_id))
-
-    def delete_norm(self, norm_id: int):
-        """Удаление нормы"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM documentary_norms WHERE id = %s', (norm_id,))
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ТЕХНИЧЕСКИМИ КОЭФФИЦИЕНТАМИ ===
 

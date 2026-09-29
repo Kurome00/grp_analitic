@@ -2,12 +2,12 @@ from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
-from config import EQUIPMENT_NORMS
-from models import Equipment
+from core.models import Equipment
+from core.timefmt import years_to_text
 
 
 class DocumentaryAnalyzer:
-    """Анализатор соответствия оборудования документальным нормам"""
+    """Анализатор сроков службы оборудования по заменяемым запчастям"""
 
     def __init__(self, norms_db):
         self.norms_db = norms_db
@@ -46,44 +46,37 @@ class DocumentaryAnalyzer:
     def get_norm_for_equipment(self, equipment_name: str,
                                equipment_id: Optional[int] = None,
                                install_date: Optional[str] = None) -> Optional[float]:
-        """Нормативный срок для оборудования.
+        """Эффективный срок службы оборудования по заменяемым запчастям.
 
-        Если известно оборудование с запчастями — срок определяется по запчастям
-        (слабое звено). Иначе ищем в БД (точное или подстрочное совпадение),
-        затем в базовых нормах config.EQUIPMENT_NORMS.
-        Возвращает None, если норма не найдена.
+        Оборудование не имеет собственного срока; срок равен минимальному
+        сроку службы заменяемых запчастей. None — если заменяемых запчастей
+        нет.
         """
         if equipment_id is not None:
             effective = self.get_effective_norm(equipment_id, install_date)
             if effective is not None:
                 return float(effective)
-
-        for _, norm_name, max_years, _ in self.norms_db.get_all_norms():
-            if norm_name and (equipment_name == norm_name or norm_name in equipment_name):
-                return float(max_years)
-
-        for key, years in EQUIPMENT_NORMS.items():
-            if key in equipment_name:
-                return float(years)
         return None
 
     def get_effective_norm(self, equipment_id: int, install_date: str) -> Optional[float]:
         """Эффективный срок службы по запчастям (принцип 'слабого звена').
 
-        Для каждой запчасти срок окончания = дата установки запчасти +
-        норма запчасти. Дата установки запчасти по умолчанию = дата установки
-        оборудования. Результат = срок окончания самой 'слабой' запчасти
-        относительно даты установки оборудования. Может быть отрицательным
-        (запчасть уже просрочена). None — если запчастей нет.
+        Учитываются только заменяемые детали (со звездой в альбоме, срок
+        службы которых 5 лет). Для каждой такой запчасти срок окончания =
+        дата установки запчасти + норма запчасти. Дата установки запчасти
+        по умолчанию = дата установки оборудования. Результат = срок
+        окончания самой 'слабой' запчасти относительно даты установки
+        оборудования. Может быть отрицательным (запчасть уже просрочена).
+        None — если заменяемых запчастей нет.
         """
-        parts = self.norms_db.get_equipment_parts(equipment_id)
+        parts = self.norms_db.get_equipment_parts_full(equipment_id)
         if not parts:
             return None
 
         equip_install = self._parse_date(install_date)
         active_norms = []
-        for _ep_id, _part_id, _pname, pnorm, p_install, p_removal in parts:
-            if p_removal:
+        for _ep_id, _part_id, _pname, pnorm, p_install, p_removal, _pnumb, is_repl in parts:
+            if p_removal or not is_repl:
                 continue
             try:
                 active_norms.append(float(pnorm))
@@ -99,8 +92,8 @@ class DocumentaryAnalyzer:
             return min(active_norms)
 
         expiries = []
-        for _ep_id, _part_id, _pname, pnorm, p_install, p_removal in parts:
-            if p_removal:
+        for _ep_id, _part_id, _pname, pnorm, p_install, p_removal, _pnumb, is_repl in parts:
+            if p_removal or not is_repl:
                 continue
             part_start = self._parse_date(p_install) or equip_install
             try:
@@ -117,17 +110,18 @@ class DocumentaryAnalyzer:
         """Оставшийся срок службы оборудования, лет.
 
         Оборудование не имеет собственного срока: его срок равен
-        минимальному оставшемуся сроку службы среди всех активных
-        запчастей. None — если активных запчастей нет.
+        минимальному оставшемуся сроку службы среди заменяемых запчастей
+        (со звездой в альбоме, срок службы 5 лет). None — если активных
+        заменяемых запчастей нет.
         """
-        parts = self.norms_db.get_equipment_parts(equipment_id)
+        parts = self.norms_db.get_equipment_parts_full(equipment_id)
         if not parts:
             return None
 
         equip_install = self._parse_date(install_date)
         remaining = []
-        for _ep, _pid, _pname, pnorm, p_install, p_removal in parts:
-            if p_removal:
+        for _ep, _pid, _pname, pnorm, p_install, p_removal, _pnumb, is_repl in parts:
+            if p_removal or not is_repl:
                 continue
             part_start = self._parse_date(p_install) or equip_install
             if part_start is None:
@@ -143,15 +137,20 @@ class DocumentaryAnalyzer:
         return min(remaining)
 
     def get_parts_status(self, equipment_id: int, install_date: str) -> List[Dict]:
-        """Статус каждой запчасти оборудования: имя, норма, дата установки,
-        дата окончания, остаток ресурса (лет)."""
-        parts = self.norms_db.get_equipment_parts(equipment_id)
+        """Статус каждой заменяемой запчасти оборудования: имя, норма, дата
+        установки, дата окончания, остаток ресурса (лет).
+
+        В расчёт срока оборудования идут только заменяемые детали.
+        """
+        parts = self.norms_db.get_equipment_parts_full(equipment_id)
         equip_install = self._parse_date(install_date)
         if not parts or equip_install is None:
             return []
 
         status_list = []
-        for _ep_id, _part_id, pname, pnorm, p_install, p_removal in parts:
+        for _ep_id, _part_id, pname, pnorm, p_install, p_removal, pnumb, is_repl in parts:
+            if not is_repl:
+                continue
             part_start = self._parse_date(p_install) or equip_install
             try:
                 norm_years = float(pnorm)
@@ -168,13 +167,13 @@ class DocumentaryAnalyzer:
             })
         return sorted(status_list, key=lambda s: (s['expiry_date'] if not s['removed'] else '9999'))
 
-    def _resolve_norm(self, equip: Equipment) -> Tuple[Optional[float], str]:
-        """Норма и её источник: 'parts' — по запчастям, иначе 'document'."""
+    def _resolve_norm(self, equip: Equipment) -> Tuple[Optional[float], Optional[str]]:
+        """Норма и её источник: 'parts' — по запчастям, иначе None."""
         if getattr(equip, 'id', None):
             effective = self.get_effective_norm(equip.id, equip.install_date)
             if effective is not None:
                 return effective, 'parts'
-        return self.get_norm_for_equipment(equip.name), 'document'
+        return None, None
 
     def get_replacement_history(self, equipment_list: List[Equipment]) -> Dict:
         """История замен по каждому типу оборудования (только демонтированное)"""
@@ -193,7 +192,7 @@ class DocumentaryAnalyzer:
 
                 if norm and lifetime_years > norm:
                     excess = lifetime_years - norm
-                    status = f"ЗАМЕНЕНО (превышение {excess:.1f} лет)"
+                    status = f"ЗАМЕНЕНО (превышение {years_to_text(excess)})"
                 elif norm and lifetime_years < norm * 0.8:
                     status = "ЗАМЕНЕНО (досрочно)"
                 else:
@@ -361,7 +360,7 @@ class DocumentaryAnalyzer:
                 mark = "🟡"
             else:
                 mark = "🟢"
-            notes.append(f"      {mark} {p['name']} — оконч. {p['expiry_date']}, остаток {p['remaining']:.1f} лет")
+            notes.append(f"      {mark} {p['name']} — оконч. {p['expiry_date']}, остаток {years_to_text(p['remaining'])}")
         return notes
 
     def generate_documentary_report(self, grp_id: int, grp_name: str, equipment_list: List[Equipment]) -> str:
@@ -399,10 +398,10 @@ class DocumentaryAnalyzer:
             for e in analysis['current']['exceeded']:
                 report_lines.append(f"\n🔴 {e['name']}")
                 report_lines.append(f"   📅 Установлено: {e['install_date']}")
-                report_lines.append(f"   ⏱ Возраст: {e['age_years']:.1f} лет")
-                report_lines.append(f"   📆 Мин. остаток по запчастям: {e['remaining']:.1f} лет")
+                report_lines.append(f"   ⏱ Возраст: {years_to_text(e['age_years'])}")
+                report_lines.append(f"   📆 Мин. остаток по запчастям: {years_to_text(e['remaining'])}")
                 report_lines.extend(self._format_parts_notes(e))
-                report_lines.append(f"   ⚠️ ПРОСРОЧЕНО на: {e['exceeded_years']:.1f} лет!")
+                report_lines.append(f"   ⚠️ ПРОСРОЧЕНО на: {years_to_text(e['exceeded_years'])}!")
             report_lines.append("")
 
         # Предупреждения (срок истечёт в течение года)
@@ -412,7 +411,7 @@ class DocumentaryAnalyzer:
                 report_lines.append(f"\n🟡 {w['name']}")
                 report_lines.append(f"   📅 Установлено: {w['install_date']}")
                 report_lines.extend(self._format_parts_notes(w))
-                report_lines.append(f"   ⏰ Осталось по слабой запчасти: {w['left_years']:.1f} лет ({w['left_years']*12:.0f} мес.)")
+                report_lines.append(f"   ⏰ Осталось по слабой запчасти: {years_to_text(w['left_years'])}")
             report_lines.append("")
 
         # В норме
@@ -421,7 +420,7 @@ class DocumentaryAnalyzer:
             for n in analysis['current']['normal']:
                 report_lines.append(f"\n🟢 {n['name']}")
                 report_lines.append(f"   📅 Установлено: {n['install_date']}")
-                report_lines.append(f"   📆 Остаток ресурса (мин. по запчастям): {n['left_years']:.1f} лет")
+                report_lines.append(f"   📆 Остаток ресурса (мин. по запчастям): {years_to_text(n['left_years'])}")
                 report_lines.extend(self._format_parts_notes(n))
             report_lines.append("")
 
@@ -441,9 +440,9 @@ class DocumentaryAnalyzer:
             for equip_type, replacements in analysis['history']['replacement_history'].items():
                 report_lines.append(f"\n📌 {equip_type}:")
                 for r in replacements[-5:]:
-                    report_lines.append(f"   • {r['install_date']} → {r['removal_date']}: {r['lifetime_years']:.1f} лет")
+                    report_lines.append(f"   • {r['install_date']} → {r['removal_date']}: {years_to_text(r['lifetime_years'])}")
                     if r['norm'] and r['lifetime_years'] > r['norm']:
-                        report_lines.append(f"     ПРЕВЫШЕНИЕ: {r['exceeded']:.1f} лет")
+                        report_lines.append(f"     ПРЕВЫШЕНИЕ: {years_to_text(r['exceeded'])}")
                 if len(replacements) > 5:
                     report_lines.append(f"   ... и еще {len(replacements) - 5} записей")
                 report_lines.append("")
@@ -458,8 +457,8 @@ class DocumentaryAnalyzer:
                     current_mark = " (В ЭКСПЛУАТАЦИИ!)" if e['is_current'] else ""
                     report_lines.append(f"   • {e['name']}{current_mark}")
                     report_lines.append(f"     Период: {e['install_date']} → {e['removal_date']}")
-                    report_lines.append(f"     Факт: {e['lifetime_years']:.1f} лет / Норма: {e['norm']} лет")
-                    report_lines.append(f"     ПРЕВЫШЕНИЕ: {e['exceeded']:.1f} лет")
+                    report_lines.append(f"     Факт: {years_to_text(e['lifetime_years'])} / Норма: {years_to_text(e['norm'])}")
+                    report_lines.append(f"     ПРЕВЫШЕНИЕ: {years_to_text(e['exceeded'])}")
                 if len(exceeds) > 3:
                     report_lines.append(f"     ... и еще {len(exceeds) - 3} записей")
                 report_lines.append("")
@@ -478,8 +477,8 @@ class DocumentaryAnalyzer:
 
             all_exceeds = [e['exceeded'] for exceeds in analysis['history']['exceeded_by_type'].values() for e in exceeds]
             if all_exceeds:
-                report_lines.append(f"\n📊 Среднее превышение по всем случаям: {sum(all_exceeds)/len(all_exceeds):.1f} лет")
-                report_lines.append(f"📊 Максимальное превышение: {max(all_exceeds):.1f} лет")
+                report_lines.append(f"\n📊 Среднее превышение по всем случаям: {years_to_text(sum(all_exceeds)/len(all_exceeds))}")
+                report_lines.append(f"📊 Максимальное превышение: {years_to_text(max(all_exceeds))}")
 
         # ====== РЕКОМЕНДАЦИИ ======
         report_lines.append("")

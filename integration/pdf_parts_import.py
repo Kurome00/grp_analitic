@@ -1,27 +1,31 @@
 # -*- coding: utf-8 -*-
 """Парсер альбома запчастей PDF: оборудование -> список запчастей.
 
-Использование:
-    py pdf_parts_import.py --scan "<файл.pdf>"          # показать что найдено
-    py pdf_parts_import.py --import "<файл.pdf>"          # наполнить справочник запчастей
-    py pdf_parts_import.py --import "<файл.pdf>" --demo   # + привязать совпавшее оборудование
-    py pdf_parts_import.py --import "<файл.pdf>" --norm 7 # срок по умолчанию для новых запчастей (лет)
+Использование (запускать из корня проекта):
+    py -m integration.pdf_parts_import --scan "<файл.pdf>"          # показать что найдено
+    py -m integration.pdf_parts_import --import "<файл.pdf>"        # наполнить справочник запчастей
+    py -m integration.pdf_parts_import --import "<файл.pdf>" --demo # + привязать совпавшее оборудование
+    py -m integration.pdf_parts_import --import "<файл.pdf>" --norm 7 # норма для новых запчастей (лет)
 
 Логика: каждая страница = единица оборудования с таблицей (Позиция/Обозначение/
 Наименование/К-ВО). Все уникальные наименования запчастей добавляются в таблицу
-parts (норма по умолчанию, правится вручную на вкладке 'Запчасти'). При --demo
-оборудование из БД, чьё имя совпадает с названием единицы из альбома, автоматически
-пополняется этими запчастями.
+parts с нормой по умолчанию = срок полной проверки (20 лет), правится вручную
+на вкладке 'Запчасти'. При --import-flags детали, помеченные в альбоме
+заменяемыми, получают срок 5 лет. При --demo оборудование из БД, чьё имя
+совпадает с названием единицы из альбома, автоматически пополняется этими
+запчастями.
 """
 import re
 import sys
 
 import pdfplumber
 
-from config import DB_CONFIG
-from database_pg import DatabasePG
+from core.config import DB_CONFIG, FULL_CHECK_TERM, part_norm
+from db.database_pg import DatabasePG
 
-DEFAULT_NORM_YEARS = 5.0
+# Норма по умолчанию для новых деталей: срок полной проверки оборудования.
+# Детали, отмеченные заменяемыми, получают 5 лет (см. import_flags).
+DEFAULT_NORM_YEARS = FULL_CHECK_TERM
 
 # Слова-мусор в заголовках страниц (заголовки таблиц, служебное)
 _HEADER_WORDS = {'ПОЗИЦИЯ', 'ОБОЗНАЧЕНИЕ', 'НАИМЕНОВАНИЕ', 'К-ВО', 'ПРИМЕЧАНИЕ'}
@@ -214,6 +218,178 @@ def import_to_db(db, units, link_to_equipment: bool = False, norm: float = DEFAU
               "    или добавьте запчасти вручную через окно 'Показать оборудование' -> 'Запчасти'.")
 
 
+# Расходные детали (срок службы 5 лет, подлежат замене по звёздочке в альбоме).
+# Эвристика по умолчанию — список уточняется пользователем в интерфейсе.
+REPLACEABLE_KEYWORDS = (
+    'кольцо', 'прокладка', 'мембрана', 'пружина', 'клапан', 'седло', 'тарелка',
+    'ролик', 'палец', 'сухарь', 'шток', 'диск', 'фильтр', 'манжета', 'сальник',
+    'поршень', 'упор', 'хомут', 'дроссель', 'регулятор пилотный',
+    'механизм настройки пзк',
+)
+
+# Исключения конструктивных деталей (не заменяемые), даже если слово попало выше
+NON_REPLACEABLE_EXACT = {'клапан предохранительный', 'клапан перепускной'}
+
+
+def _norm(name: str) -> str:
+    """Нормализация названия для сопоставления."""
+    return re.sub(r'\s+', ' ', name or '').replace('ё', 'е').strip().lower()
+
+
+def _name_matches(row_name: str, part_name: str) -> bool:
+    a, b = _norm(row_name), _norm(part_name)
+    if not a or not b:
+        return False
+    a = a.split(' гост ')[0].strip()
+    b = b.split(' гост ')[0].strip()
+    return a == b or (len(a) >= 4 and len(b) >= 4 and (a in b or b in a))
+
+
+def _part_replaceable(name: str) -> bool:
+    n = _norm(name)
+    if n in {_norm(x) for x in NON_REPLACEABLE_EXACT}:
+        return False
+    return any(k in n for k in REPLACEABLE_KEYWORDS)
+
+
+def scan_rows_with_flags(pdf_path: str):
+    """Читает таблицы альбома: для каждого листа (модели) возвращает строки
+    (обозначение, наименование, звёздочка рядом со строкой)."""
+    units = []
+    with pdfplumber.open(pdf_path) as pdf:
+        toc = parse_toc(pdf)
+        for idx, page in enumerate(pdf.pages):
+            page_no = idx + 1
+            title = toc.get(page_no, '')
+            if not title:
+                title = _clean_title((page.extract_text() or '').splitlines())
+            stars = [w for w in page.extract_words(keep_blank_chars=False) if '*' in w['text']]
+
+            # Выбираем таблицу с нужными колонками; координаты строк берём из
+            # объекта Table (для привязки звёздочек к строкам по вертикали).
+            found = []
+            for t in page.find_tables():
+                try:
+                    tbl = t.extract()
+                except Exception:
+                    continue
+                if not tbl:
+                    continue
+                hdr = tbl[0] if tbl else []
+                if len(hdr) < 3:
+                    continue
+                hs = [str((c or '').strip()) for c in hdr]
+                if 'Обозначение' in hs and 'Наименование' in hs:
+                    found.append((t, tbl))
+            if not found:
+                # запасной вариант — как в scan_pdf
+                tbl = page.extract_table()
+                if tbl and tbl[0]:
+                    found.append((None, tbl))
+
+            for t, tbl in found:
+                hdr = tbl[0]
+                hs = [str((c or '').strip()) for c in hdr]
+                des_i = hs.index('Обозначение') if 'Обозначение' in hs else 0
+                nam_i = hs.index('Наименование') if 'Наименование' in hs else 0
+                for nr, row in enumerate(tbl[1:], start=1):
+                    if not row or not row[nam_i]:
+                        continue
+                    design = _sanitize(row[des_i]) if des_i < len(row) else ''
+                    name = _sanitize(row[nam_i])
+                    if not name or name == 'Наименование':
+                        continue
+                    starred = False
+                    if t and nr < len(t.rows):
+                        cells = t.rows[nr].cells
+                        cell0 = cells[0] if cells else None
+                        if cell0:
+                            _x0, top, _x1, bottom = cell0
+                            starred = any(top - 4 <= s['top'] <= bottom + 4 for s in stars)
+                    units.append({
+                        'page': page_no,
+                        'unit': title,
+                        'design': design,
+                        'name': name,
+                        'star': starred,
+                    })
+    return units
+
+
+def import_flags(pdf_path: str):
+    """Проставляет обозначения (part_number) на связях каталога и отмечает
+    заменяемые детали в справочнике (эвристика, правится пользователем)."""
+    db = DatabasePG(DB_CONFIG)
+    rows = scan_rows_with_flags(pdf_path)
+    print(f"[+] Строк таблиц альбома: {len(rows)}")
+
+    catalog_id = None
+    for g in db.get_all_grp():
+        if 'каталог' in g[1].lower():
+            catalog_id = g[0]
+            break
+    if catalog_id is None:
+        print("[!] ГРП-каталог не найден")
+        return
+    equipment = db.get_equipment_by_grp(catalog_id)
+    eq_by_name = {e[1].lower(): e for e in equipment}
+
+    set_flags = {}
+    filled = 0
+    matched_rows = 0
+    for row in rows:
+        unit = row['unit']
+        eq = eq_by_name.get(unit.lower())
+        if not eq:
+            eq = next((e for e in equipment
+                       if unit.lower() in e[1].lower() or e[1].lower() in unit.lower()), None)
+        if not eq:
+            continue
+        # наименование детали из таблицы альбома -> деталь в составе модели
+        part = next((p for p in db.get_equipment_parts(eq[0])
+                     if _name_matches(row['name'], p[2])), None)
+        if not part:
+            continue
+        matched_rows += 1
+        ep_id, part_id, part_name = part[0], part[1], part[2]
+        # обозначение (каталожный номер), только если похож на номер
+        if row['design'] and re.match(r'^[`]?\d{2,3}-|^[`]?АТ-|^[`]?ЕЛШУ\.', row['design'].strip()):
+            with db.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute('UPDATE equipment_parts SET part_number = %s WHERE id = %s',
+                            (row['design'].strip().lstrip('`'), ep_id))
+            filled += 1
+        already = set_flags.get(part_name)
+        flag = _part_replaceable(row['name'])
+        if already is not None:
+            flag = flag or already
+        set_flags[part_name] = flag
+
+    print(f"[+] Из строк таблиц сопоставлено с каталогом: {matched_rows}")
+    print(f"[+] Обозначений (part_number) проставлено: {filled}")
+
+    replaceable = [n for n, f in set_flags.items() if f]
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute('UPDATE parts SET is_replaceable = FALSE')
+    for name, flag in set_flags.items():
+        part = db.get_part_by_name(name)
+        if not part:
+            continue
+        db.update_part_replaceable(part[0], flag)
+        if flag:
+            # Заменяемая деталь живёт 5 лет; всё остальное — срок полной
+            # проверки. Признак и норма хранятся согласованно.
+            db.update_part_norm(part[0], part_norm(True))
+    print(f"[+] Отмечено заменяемых деталей: {len(replaceable)}")
+    print(f"\nЗаменяемые (срок {part_norm(True):g} лет):")
+    for n in sorted(replaceable, key=str.lower):
+        print(f"    - {n}")
+    non = [n for n, f in set_flags.items() if not f]
+    print(f"\nОстальные ({len(non)}) — срок {part_norm(False):g} лет. "
+          f"Поправить можно на вкладке 'Запчасти'.")
+
+
 def main():
     args = sys.argv[1:]
     links = '--demo' in args
@@ -227,9 +403,14 @@ def main():
 
     pdf = [a for a in args if a.lower().endswith('.pdf')]
     if not pdf:
-        print("Не указан PDF. Пример: py pdf_parts_import.py --scan 'Альбом запчастей по газу.pdf'")
+        print("Не указан PDF. Пример: py -m integration.pdf_parts_import --scan "
+              "'docs/Альбом запчастей по газу.pdf'")
         sys.exit(1)
     pdf_path = pdf[0]
+
+    if '--flags' in args:
+        import_flags(pdf_path)
+        return
 
     grp_name = None
     if '--catalog' in args:

@@ -9,10 +9,13 @@
 изменении, поэтому посторонние листы файла сохраняются.
 """
 import os
+import re
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+from core.config import PROJECT_ROOT
 
 # Колонки журнала замен — как в образце (листы «Ремонт …» в Лида.xlsx)
 REPLACEMENT_HEADERS = [
@@ -34,8 +37,8 @@ HEADER_FILL = PatternFill("solid", fgColor="DDEBF7")
 
 
 def default_filename() -> str:
-    """Путь к файлу «Замены.xlsx» рядом с модулем приложения."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "Замены.xlsx")
+    """Путь к файлу «Замены.xlsx» в корне проекта."""
+    return os.path.join(PROJECT_ROOT, "Замены.xlsx")
 
 
 def sheet_name_for(grp_type: str) -> str:
@@ -47,6 +50,39 @@ def sheet_name_for(grp_type: str) -> str:
 
 def _is_catalog_grp(grp_type: str) -> bool:
     return bool(grp_type and 'каталог' in grp_type.lower())
+
+
+def _to_excel_date(value) -> str:
+    """Приводит дату к формату журнала «М.ГГГГ» (напр. 01.2023).
+
+    Принимает: '12.01.2023', '12.01.2023г.', '2023-01-12',
+    '01.2023' — и оставляет прочие записи как есть (примечания).
+    """
+    if value is None or str(value).strip() == '':
+        return ''
+    s = str(value).strip()
+    m = re.match(r'^(\d{2,4})[.\-](\d{1,2})[.\-](\d{1,2})$', s)
+    if m:
+        month = int(m.group(2))
+        year = m.group(1)
+        if len(year) == 2:
+            year = '20' + year
+        return f'{month:02d}.{year}'
+    m = re.match(r'^(\d{1,2})[.\-](\d{1,2})[.\-](\d{2,4})', s)
+    if m:
+        month = int(m.group(2))
+        year = m.group(3)
+        if len(year) == 2:
+            year = '20' + year
+        return f'{month:02d}.{year}'
+    m = re.match(r'^(\d{1,2})[.\-](\d{2,4})$', s)
+    if m:
+        month = int(m.group(1))
+        year = m.group(2)
+        if len(year) == 2:
+            year = '20' + year
+        return f'{month:02d}.{year}'
+    return s
 
 
 def sync_replacements_workbook(db, filename: str = None) -> str:
@@ -88,7 +124,7 @@ def sync_replacements_workbook(db, filename: str = None) -> str:
             # (id, replace_date, part_number, equipment_type, model,
             #  manufacturer, work_type, reason, supervisor)
             ws.append([
-                r[1], r[2], r[3], r[4], r[5], grp_type, grp_id, r[6], r[7], r[8],
+                _to_excel_date(r[1]), r[2], r[3], r[4], r[5], grp_type, grp_id, r[6], r[7], r[8],
             ])
 
         for i, width in enumerate(COLUMN_WIDTHS, start=1):

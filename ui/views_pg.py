@@ -1,16 +1,21 @@
 import os
+import re
 import tkinter as tk
 from tkinter import ttk, messagebox, Toplevel, filedialog, scrolledtext
 from datetime import datetime
 from typing import List, Optional
 
-from config import DB_CONFIG
-from database_pg import DatabasePG
-from models import Equipment
-from documentary_analyzer import DocumentaryAnalyzer
-from statistic_analyzer import StatisticsAnalyzer
-from technical_analyzer_pg import TechnicalAnalyzer
-import excel_sync
+from core.config import DB_CONFIG
+from core.models import Equipment
+from core.timefmt import years_to_text
+from db.database_pg import DatabasePG
+from integration import excel_sync, word_report_pg
+from integration.pdf_parts_import import scan_pdf, import_to_db, create_catalog_equipment
+from logic.documentary_analyzer import DocumentaryAnalyzer
+from logic.statistic_analyzer import StatisticsAnalyzer
+from logic.technical_analyzer_pg import TechnicalAnalyzer
+
+from .algorithms_view import AlgorithmsWindow
 
 # Варианты вида работ при замене запасной части (как в образце Лида.xlsx)
 WORK_TYPES = [
@@ -66,15 +71,16 @@ MENU_STRUCTURE = [
         ("➕ Добавить оборудование", "add_equipment", "grp"),
         ("🔩 Оборудование и запчасти", "view_equipment", "grp"),
         ("🛠 Замены (ремонт)", "view_repairs", "grp"),
-        ("📄 Документальный анализ", "documentary_analysis", "grp"),
+        ("🔧 Замена запчасти", "replace_part", "grp"),
+        ("📏 Отчёт по ГРП (Word)", "export_grp_word", "grp"),
         ("⚠️ Предупреждения", "show_warnings", "grp"),
         ("🧮 Расчёт алгоритмов", "open_algorithms", "grp"),
         ("🔧 Технические коэффициенты", "view_tech", "grp"),
         ("📊 Статистика", "view_stats", "grp"),
     ]),
     ("Справочники", [
-        ("📋 Документальные нормы", "view_norms", "always"),
         ("📦 Каталог оборудования", "view_catalog", "always"),
+        ("📂 Импорт из PDF-альбома", "import_catalog_pdf", "always"),
         ("📤 Обновить файл Excel", "sync_excel", "always"),
     ]),
 ]
@@ -111,7 +117,6 @@ class GRPAppPG:
         self.current_grp_id: Optional[int] = None
         self.current_grp_name: str = ""
         self.setup_ui()
-        self.refresh_norms_table()
         self.update_catalog_combo()
         self.sync_excel(silent=True)
 
@@ -128,12 +133,30 @@ class GRPAppPG:
         ]
 
     def _parts_aware_norm(self, equip: Equipment) -> Optional[float]:
-        """Норма оборудования: по запчастям (слабое звено), иначе документальная."""
+        """Норма оборудования по заменяемым запчастям (слабое звено)."""
         return self.doc_analyzer.get_norm_for_equipment(
             equip.name,
             getattr(equip, 'id', None),
             equip.install_date if hasattr(equip, 'install_date') else None
         )
+
+    @staticmethod
+    def _part_remaining_life(part_install: Optional[str], equip_install: Optional[str],
+                             norm_years) -> Optional[float]:
+        """Остаток ресурса одной детали, лет.
+
+        Считается от даты установки самой детали (последней замены), а если она
+        не задана — от даты установки оборудования. Если нет ни одной даты,
+        остаток неизвестен и возвращается None.
+        """
+        start = (DocumentaryAnalyzer._parse_date(part_install)
+                 or DocumentaryAnalyzer._parse_date(equip_install))
+        if start is None:
+            return None
+        try:
+            return float(norm_years) - (datetime.now().date() - start).days / 365.25
+        except (TypeError, ValueError):
+            return None
 
     def _btn(self, parent, text, command, color='primary', font_size=9, padx=10, **extra):
         """Единая цветная кнопка интерфейса с эффектом наведения."""
@@ -210,7 +233,6 @@ class GRPAppPG:
         self.tabs = {}
         views = [
             ("grp", "🏗️  Рабочее ГРП", self.setup_grp_tab),
-            ("norms", "📋  Документальные нормы", self.setup_norms_tab),
             ("catalog", "📦  Каталог оборудования", self.setup_catalog_tab),
             ("tech", "🔧  Технические коэффициенты", self.setup_tech_tab),
             ("stats", "📊  Статистика", self.setup_stats_tab),
@@ -379,12 +401,12 @@ class GRPAppPG:
             "2. Выбранный ГРП показывается вверху слева.\n"
             "3. Все действия в меню применяются к выбранному ГРП:\n"
             "   оборудование, замены, анализ, предупреждения, статистика.\n"
-            "4. «Справочники» — нормы и каталог моделей оборудования.\n"
+            "4. «Справочники» — каталог моделей оборудования и обновление Excel.\n"
             "5. Журнал замен автоматически пишется в файл «Замены.xlsx»."
         )
 
     def setup_grp_tab(self):
-        """Рабочий экран: карточка информации и таблица оборудования выбранного ГРП."""
+        """Рабочий экран: карточка информации, оборудование и его запчасти в одном окне."""
         self.info_card = tk.LabelFrame(self.grp_tab, text="Информация о ГРП",
                                        font=("Arial", 10, "bold"), padx=12, pady=10)
         self.info_card.pack(fill=tk.X, padx=12, pady=(12, 6))
@@ -397,60 +419,390 @@ class GRPAppPG:
 
         self.info_label = tk.Label(
             self.info_card,
-            text="Выберите существующий («🗂 Выбрать ГРП») или создайте новый («➕ Создать ГРП») в меню слева.",
+            text="",
             font=("Arial", 10), fg="#6c757d", justify=tk.LEFT, anchor=tk.W, wraplength=1050
         )
         self.info_label.pack(anchor=tk.W, pady=(4, 0))
 
-        tree_frame = tk.Frame(self.grp_tab)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
+        # === Оборудование текущего ГРП ===
+        equip_card = tk.LabelFrame(self.grp_tab, text="Оборудование",
+                                   font=("Arial", 10, "bold"), padx=12, pady=8)
+        equip_card.pack(fill=tk.X, padx=12, pady=(0, 6))
+
+        equip_buttons = tk.Frame(equip_card)
+        equip_buttons.pack(fill=tk.X, pady=(0, 4))
+        self._btn(equip_buttons, "➕ Добавить оборудование", self.add_equipment, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(equip_buttons, "🗑 Удалить оборудование", self._delete_selected_equipment, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(equip_buttons, "🔍 Проверить по нормам", self._check_selected_norm, color='info', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
 
         columns = ("ID", "Наименование", "Остаток срока", "Дата установки", "Дата снятия")
-        self.home_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10)
+        self.home_tree = ttk.Treeview(equip_card, columns=columns, show="headings", height=7)
         widths = {"ID": 60, "Наименование": 440, "Остаток срока": 150,
                   "Дата установки": 120, "Дата снятия": 150}
         for c in columns:
             self.home_tree.heading(c, text=c)
             self.home_tree.column(c, width=widths.get(c, 120))
+        self.home_tree.pack(fill=tk.BOTH, expand=True)
 
-        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.home_tree.yview)
-        self.home_tree.configure(yscrollcommand=vsb.set)
-        self.home_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        # === Запчасти выбранного оборудования ===
+        self.parts_card = tk.LabelFrame(self.grp_tab, text="🔩 Запчасти выбранного оборудования",
+                                        font=("Arial", 10, "bold"), padx=12, pady=8)
+        self.parts_card.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 6))
 
-        self.home_hint = tk.Label(
-            self.grp_tab, text="Оборудование выбранного ГРП появится здесь после выбора в меню.",
-            font=("Arial", 9), fg="#adb5bd", justify=tk.CENTER
-        )
-        self.home_hint.pack(fill=tk.X, pady=(0, 6))
+        self.parts_buttons = tk.Frame(self.parts_card)
+        self.parts_buttons.pack(fill=tk.X, pady=(0, 4))
+        self._btn(self.parts_buttons, "➕ Добавить запчасть", self._add_part_to_selected, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(self.parts_buttons, "✏ Даты", self._edit_selected_part_dates, color='warning', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(self.parts_buttons, "✏ Норма", self._edit_selected_part_norm, color='warning', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(self.parts_buttons, "🔄 Заменяемая", self._toggle_selected_part_replaceable, color='info', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(self.parts_buttons, "🗑 Удалить из состава", self._remove_selected_part, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+
+        self.parts_effective_label = tk.Label(self.parts_card, text="",
+                                              font=("Arial", 10, "bold"), fg="#546E7A")
+        self.parts_effective_label.pack(anchor=tk.W, pady=(0, 4))
+
+        parts_frame = tk.Frame(self.parts_card)
+        parts_frame.pack(fill=tk.BOTH, expand=True)
+
+        pcolumns = ("ID", "Запчасть", "Обозначение", "Замен.", "Дата установки / замены", "Остаток")
+        self.parts_tree = ttk.Treeview(parts_frame, columns=pcolumns, show="headings", height=7)
+        pwidths = {"ID": 40, "Запчасть": 280, "Обозначение": 180, "Замен.": 55,
+                   "Дата установки / замены": 160, "Остаток": 120}
+        for c in pcolumns:
+            self.parts_tree.heading(c, text=c)
+            self.parts_tree.column(c, width=pwidths.get(c, 100))
+
+        pvsb = ttk.Scrollbar(parts_frame, orient=tk.VERTICAL, command=self.parts_tree.yview)
+        self.parts_tree.configure(yscrollcommand=pvsb.set)
+        self.parts_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        pvsb.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.home_tree.bind('<<TreeviewSelect>>', self._on_home_select)
-        self.home_tree.bind('<Double-1>', self._on_home_double_click)
+        self.home_tree.bind('<Double-1>', lambda e: self._select_equipment_parts())
 
-    def _on_home_select(self, event):
-        sel = self.home_tree.selection()
-        if sel:
-            values = self.home_tree.item(sel[0])['values']
-            self.statusbar.config(text=f"Оборудование: {values[1]} (ID={values[0]})")
-
-    def _on_home_double_click(self, event):
+    def _current_selected_equip(self):
+        """Выбранное в главной таблице оборудование: (ep_id, name, install) или None."""
         sel = self.home_tree.selection()
         if not sel:
-            return
+            return None
         values = self.home_tree.item(sel[0])['values']
-        self.equipment_parts_window(int(values[0]), values[1], values[3])
+        return (int(values[0]), values[1], values[3])
+
+    def _select_equipment_parts(self):
+        """Показать запчасти выбранного оборудования в нижней панели."""
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            return
+        self._refresh_parts_panel(ctx[0], ctx[1], ctx[2])
+
+    def _refresh_parts_panel(self, equip_id: int, equip_name: str, equip_install: Optional[str]):
+        """Заполнение нижней панели запчастями выбранного оборудования."""
+        for row in self.parts_tree.get_children():
+            self.parts_tree.delete(row)
+
+        parts = self.db.get_equipment_parts_full(equip_id)
+        install_txt = equip_install or "—"
+        self.parts_card.config(text=f"🔩 Запчасти: {equip_name}  (срок от даты установки: {install_txt})")
+
+        for ep in parts:
+            if ep[5]:  # снятая запись (история замены) — в составе не показываем
+                continue
+            zam = "✓" if ep[7] else "—"
+            # Срок детали считается от даты её установки, а если она не задана —
+            # от даты установки оборудования.
+            inst_date = ep[4] or equip_install
+            rem = self._part_remaining_life(ep[4], equip_install, ep[3])
+            ost = years_to_text(rem) if rem is not None else "—"
+            self.parts_tree.insert('', tk.END, values=(
+                ep[0], ep[2], ep[6] or "", zam, inst_date or "—", ost))
+
+        remaining = self.doc_analyzer.get_remaining_life(equip_id, equip_install)
+        if remaining is not None:
+            state = ""
+            if remaining < 0:
+                state = f" — ⚠️ ПРОСРОЧЕНО на {years_to_text(-remaining)}"
+            elif remaining < 1:
+                state = f" — ⚠️ осталось {years_to_text(remaining)}"
+            self.parts_effective_label.config(
+                text=f"📆 Слабейшая заменяемая деталь: осталось {years_to_text(remaining)}{state}")
+        else:
+            self.parts_effective_label.config(text="💡 Заменяемых деталей нет")
+
+    def _selected_part_row(self):
+        """Строка выбранной запчасти из нижней панели: (ep_id, name) или None."""
+        sel = self.parts_tree.selection()
+        if not sel:
+            messagebox.showwarning("Внимание", "Сначала выберите запчасть в списке!")
+            return None
+        values = self.parts_tree.item(sel[0])['values']
+        return (int(values[0]), values[1])
+
+    def _add_part_to_selected(self):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            messagebox.showwarning("Внимание", "Сначала выберите оборудование в таблице!")
+            return
+        equip_id, _equip_name, equip_install = ctx
+        self._add_equipment_part_dialog(equip_id, equip_install)
+
+    def _add_equipment_part_dialog(self, equip_id: int, equip_install: Optional[str]):
+        """Диалог добавления запчасти в состав выбранного оборудования."""
+        all_parts = self.db.get_all_parts()
+        if not all_parts:
+            messagebox.showwarning("Внимание", "Справочник запчастей пуст. Добавьте запчасти через импорт PDF-альбома или вручную.")
+            return
+
+        add_window = Toplevel(self.root)
+        add_window.title("Добавить запчасть")
+        add_window.geometry("480x260")
+        add_window.transient(self.root)
+        add_window.grab_set()
+
+        tk.Label(add_window, text="➕ Добавление запчасти в состав",
+                 font=("Arial", 12, "bold")).pack(pady=10)
+
+        frame = tk.Frame(add_window)
+        frame.pack(pady=8)
+
+        tk.Label(frame, text="Запчасть:", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
+        part_combo = ttk.Combobox(frame, width=42,
+                                  values=[f"{p[0]} - {p[1]} ({p[2]} лет){(' — зам.)' if p[3] else '')}" for p in all_parts])
+        part_combo.grid(row=0, column=1, pady=5)
+
+        tk.Label(frame, text="Дата установки:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
+        p_install = tk.Entry(frame, width=25)
+        p_install.grid(row=1, column=1, sticky=tk.W, pady=5)
+        tk.Label(frame, text="пусто = как у оборудования", font=("Arial", 8), fg="#6c757d").grid(row=2, column=1, sticky=tk.W)
+
+        tk.Label(frame, text="Дата снятия:", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
+        p_removal = tk.Entry(frame, width=25)
+        p_removal.grid(row=3, column=1, sticky=tk.W, pady=5)
+
+        def do_add():
+            selection = part_combo.get()
+            if not selection:
+                messagebox.showwarning("Внимание", "Выберите запчасть!")
+                return
+            part_id = int(selection.split(" - ")[0])
+            self.db.add_equipment_part(
+                equip_id, part_id,
+                p_install.get().strip() or None,
+                p_removal.get().strip() or None
+            )
+            add_window.destroy()
+            ctx = self._current_selected_equip()
+            if ctx:
+                self._refresh_parts_panel(ctx[0], ctx[1], ctx[2])
+
+        btn_frame = tk.Frame(add_window)
+        btn_frame.pack(pady=12)
+        self._btn(btn_frame, "💾 Добавить", do_add, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+        self._btn(btn_frame, "❌ Отмена", add_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+
+    def _edit_selected_part_dates(self):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            messagebox.showwarning("Внимание", "Сначала выберите оборудование в таблице!")
+            return
+        equip_id, _equip_name, equip_install = ctx
+        sel = self._selected_part_row()
+        if sel is None:
+            return
+        ep_id, name = sel
+        ep_data = next((ep for ep in self.db.get_equipment_parts_full(equip_id) if ep[0] == ep_id), None)
+        if not ep_data:
+            return
+        self._edit_part_dates_dialog(equip_id, ep_id, name, equip_install, ep_data)
+
+    def _edit_part_dates_dialog(self, equip_id: int, ep_id: int, name: str,
+                                equip_install: Optional[str], ep_data: tuple):
+        """Диалог изменения дат установки/снятия запчасти."""
+        default_install = equip_install if not ep_data[4] else ep_data[4]
+
+        edit_window = Toplevel(self.root)
+        edit_window.title("Изменить даты запчасти")
+        edit_window.geometry("440x220")
+        edit_window.transient(self.root)
+        edit_window.grab_set()
+
+        tk.Label(edit_window, text=f"✏ Изменение дат: {name}",
+                 font=("Arial", 12, "bold")).pack(pady=10)
+
+        frame = tk.Frame(edit_window)
+        frame.pack(pady=8)
+
+        install_entry = tk.Entry(frame, width=25)
+        removal_entry = tk.Entry(frame, width=25)
+        install_entry.insert(0, default_install or "")
+        if ep_data[5]:
+            removal_entry.insert(0, ep_data[5])
+
+        tk.Label(frame, text="Дата установки:", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
+        install_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
+        tk.Label(frame, text="Дата снятия:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
+        removal_entry.grid(row=1, column=1, sticky=tk.W, pady=5)
+
+        def save():
+            self.db.update_equipment_part(
+                ep_id,
+                install_entry.get().strip() or None,
+                removal_entry.get().strip() or None
+            )
+            edit_window.destroy()
+            ctx = self._current_selected_equip()
+            if ctx:
+                self._refresh_parts_panel(ctx[0], ctx[1], ctx[2])
+                self.load_home()
+
+        btn_frame = tk.Frame(edit_window)
+        btn_frame.pack(pady=12)
+        self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+        self._btn(btn_frame, "❌ Отмена", edit_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+
+    def _edit_selected_part_norm(self):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            messagebox.showwarning("Внимание", "Сначала выберите оборудование в таблице!")
+            return
+        equip_id, _equip_name, _install = ctx
+        sel = self._selected_part_row()
+        if sel is None:
+            return
+        ep_id, name = sel
+        ep_data = next((ep for ep in self.db.get_equipment_parts_full(equip_id) if ep[0] == ep_id), None)
+        if not ep_data:
+            return
+        self._edit_part_norm_dialog(ep_data)
+
+    def _edit_part_norm_dialog(self, ep_data: tuple):
+        """Диалог изменения нормы (срока службы) запчасти."""
+        norm_window = Toplevel(self.root)
+        norm_window.title("Изменить норму запчасти")
+        norm_window.geometry("440x190")
+        norm_window.transient(self.root)
+        norm_window.grab_set()
+
+        tk.Label(norm_window, text=f"✏ Норма запчасти: {ep_data[2]}",
+                 font=("Arial", 12, "bold")).pack(pady=10)
+
+        frame = tk.Frame(norm_window)
+        frame.pack(pady=8)
+
+        tk.Label(frame, text="Срок службы (лет):", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
+        years_entry = tk.Entry(frame, width=12)
+        years_entry.insert(0, str(ep_data[3]))
+        years_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
+
+        def save_norm():
+            try:
+                years = float(years_entry.get())
+                if years <= 0:
+                    raise ValueError
+                self.db.update_part(ep_data[1], ep_data[2], years)
+                norm_window.destroy()
+                ctx = self._current_selected_equip()
+                if ctx:
+                    self._refresh_parts_panel(ctx[0], ctx[1], ctx[2])
+                self.statusbar.config(text=f"Норма '{ep_data[2]}' = {years} лет")
+            except ValueError:
+                messagebox.showerror("Ошибка", "Неверный формат числа!")
+
+        btn_frame = tk.Frame(norm_window)
+        btn_frame.pack(pady=12)
+        self._btn(btn_frame, "💾 Сохранить", save_norm, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+        self._btn(btn_frame, "❌ Отмена", norm_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+
+    def _toggle_selected_part_replaceable(self):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            messagebox.showwarning("Внимание", "Сначала выберите оборудование в таблице!")
+            return
+        equip_id, _equip_name, _install = ctx
+        sel = self._selected_part_row()
+        if sel is None:
+            return
+        ep_id, name = sel
+        ep_data = next((ep for ep in self.db.get_equipment_parts_full(equip_id) if ep[0] == ep_id), None)
+        if not ep_data:
+            return
+        self.db.update_part_replaceable(ep_data[1], not ep_data[7])
+        self._refresh_parts_panel(equip_id, ctx[1], ctx[2])
+        part = self.db.get_part_by_name(ep_data[2])
+        self.statusbar.config(text=f"Запчасть '{ep_data[2]}' — {'заменяемая (5 лет)' if part[3] else 'не заменяемая'}")
+
+    def _remove_selected_part(self):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            messagebox.showwarning("Внимание", "Сначала выберите оборудование в таблице!")
+            return
+        equip_id, equip_name, equip_install = ctx
+        sel = self._selected_part_row()
+        if sel is None:
+            return
+        ep_id, name = sel
+        if messagebox.askyesno("Подтверждение", f"Удалить '{name}' из состава оборудования?"):
+            self.db.remove_equipment_part(ep_id)
+            self._refresh_parts_panel(equip_id, equip_name, equip_install)
+
+    def _delete_selected_equipment(self):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            messagebox.showwarning("Внимание", "Выберите оборудование для удаления!")
+            return
+        equip_id, equip_name, _install = ctx
+        if messagebox.askyesno("Подтверждение", f"Удалить оборудование '{equip_name}'?"):
+            self.db.delete_equipment(equip_id)
+            self.load_home()
+            self.statusbar.config(text=f"Оборудование '{equip_name}' удалено")
+
+    def _check_selected_norm(self):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            messagebox.showwarning("Внимание", "Выберите оборудование!")
+            return
+        equip_id, equip_name, install_date = ctx
+        remaining = self.doc_analyzer.get_remaining_life(equip_id, install_date)
+        if remaining is not None:
+            if remaining < 0:
+                status = "❌ СРОК ИСТЁК, требуется замена!"
+                note = f"⚠️ Просрочено на {years_to_text(-remaining)}"
+            elif remaining < 1:
+                status = "⚠️ Требует внимания"
+                note = f"⏰ Осталось {years_to_text(remaining)}"
+            else:
+                status = "✅ В пределах срока"
+                note = f"⏰ Остаток {years_to_text(remaining)}"
+            messagebox.showinfo("Проверка срока",
+                                f"📌 Оборудование: {equip_name}\n"
+                                f"📅 Установлено: {install_date}\n"
+                                f"🔧 Срок определяется по запчастям\n"
+                                f"📆 Мин. остаток среди запчастей: {years_to_text(remaining)}\n"
+                                f"📊 Статус: {status}\n({note})")
+        else:
+            messagebox.showwarning("Нет запчастей", f"Для '{equip_name}' нет запчастей.\n"
+                                                    f"Срока у оборудования нет.\n"
+                                                    f"Внесите оборудование (запчасти), чтобы появился срок.")
+
+    def _on_home_select(self, event):
+        ctx = self._current_selected_equip()
+        if ctx is None:
+            return
+        values = self.home_tree.item(self.home_tree.selection()[0])['values']
+        self.statusbar.config(text=f"Оборудование: {values[1]} (ID={values[0]})")
+        self._refresh_parts_panel(ctx[0], ctx[1], ctx[2])
 
     def load_home(self):
         """Обновление рабочего экрана для текущего ГРП (таблица пуста, если ГРП не выбран)."""
         for row in self.home_tree.get_children():
             self.home_tree.delete(row)
+        for row in self.parts_tree.get_children():
+            self.parts_tree.delete(row)
 
         if self.current_grp_id is None:
             self.info_name_label.config(text="ГРП не выбран", fg="#90a4ae")
-            self.info_label.config(
-                text="Выберите существующий («🗂 Выбрать ГРП») или создайте новый («➕ Создать ГРП») в меню слева."
-            )
-            self.home_hint.config(text="Оборудование выбранного ГРП появится здесь после выбора в меню.", fg="#adb5bd")
+            self.info_label.config(text="")
+            self.parts_card.config(text="🔩 Запчасти выбранного оборудования")
+            self.parts_effective_label.config(text="")
             return
 
         grp = self.db.get_grp_by_id(self.current_grp_id)
@@ -462,7 +814,7 @@ class GRPAppPG:
 
         self.info_name_label.config(text=grp[1], fg="#37474F")
         self.info_label.config(text=(
-            f"Линий: {grp[2]}   |   Фактический срок: {grp[3]} лет   |   Проектный срок: {grp[4]} лет   |   "
+            f"Линий: {grp[2]}   |   Фактический срок: {years_to_text(grp[3])}   |   Проектный срок: {years_to_text(grp[4])}   |   "
             f"Оборудование: {len(equipment)} шт.   |   Замены (ремонт): {repl_count}"
         ))
 
@@ -472,15 +824,13 @@ class GRPAppPG:
             if remaining is None:
                 lifespan = "⛔ внесите оборудование"
             elif remaining < 0:
-                lifespan = f"⚠️ просрочено ({-remaining:.1f} лет)"
+                lifespan = f"⚠️ просрочено на {years_to_text(-remaining)}"
             else:
-                lifespan = f"{remaining:.1f} лет"
+                lifespan = f"{years_to_text(remaining)}"
             self.home_tree.insert('', tk.END, values=(e[0], e[1], lifespan, e[2], status))
 
-        self.home_hint.config(
-            text=f"Оборудование ГРП «{grp[1]}» — двойной клик открывает состав запчастей",
-            fg="#6c757d"
-        )
+        self.parts_card.config(text="🔩 Запчасти выбранного оборудования")
+        self.parts_effective_label.config(text="")
 
     def view_repairs(self):
         """Перейти к журналу замен выбранного ГРП."""
@@ -503,37 +853,8 @@ class GRPAppPG:
         self.show_view("stats")
         self.show_statistics()
 
-    def view_norms(self):
-        self.show_view("norms")
-
     def view_catalog(self):
         self.show_view("catalog")
-
-    def setup_norms_tab(self):
-        btn_frame = tk.Frame(self.norms_tab)
-        btn_frame.pack(pady=10)
-
-        self._btn(btn_frame, "➕ Добавить норму", self.add_norm, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "✏ Редактировать", self.edit_norm, color='warning', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "🗑 Удалить", self.delete_norm, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "🔄 Обновить", self.refresh_norms_table, color='neutral', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-
-        table_frame = tk.Frame(self.norms_tab)
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        columns = ("ID", "Оборудование", "Макс. срок (лет)", "Примечания")
-        self.norms_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=15)
-
-        col_widths = {"ID": 50, "Оборудование": 300, "Макс. срок (лет)": 150, "Примечания": 350}
-        for col in columns:
-            self.norms_tree.heading(col, text=col)
-            self.norms_tree.column(col, width=col_widths.get(col, 150))
-
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.norms_tree.yview)
-        self.norms_tree.configure(yscrollcommand=scrollbar.set)
-
-        self.norms_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     # === РАЗДЕЛ «КАТАЛОГ ОБОРУДОВАНИЯ» ===
 
@@ -552,12 +873,12 @@ class GRPAppPG:
         self._btn(select_frame, "🔄 Обновить", self.load_catalog, color='neutral', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
 
         table_frame = tk.Frame(self.catalog_tab)
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
 
         columns = ("ID", "Наименование", "Срок службы", "Запчасти")
-        self.catalog_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=15)
+        self.catalog_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
 
-        col_widths = {"ID": 45, "Наименование": 620, "Срок службы": 110, "Запчасти": 80}
+        col_widths = {"ID": 45, "Наименование": 560, "Срок службы": 110, "Запчасти": 80}
         for col in columns:
             self.catalog_tree.heading(col, text=col)
             self.catalog_tree.column(col, width=col_widths.get(col, 100))
@@ -568,13 +889,41 @@ class GRPAppPG:
         self.catalog_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Двойной клик по оборудованию — открыть все его запчасти
-        self.catalog_tree.bind('<Double-1>', lambda e: self._catalog_open_parts())
+        # Запчасти выбранной модели — встроенная панель (без отдельного окна)
+        self.catalog_parts_card = tk.LabelFrame(self.catalog_tab, text="🔩 Запчасти модели",
+                                                font=("Arial", 10, "bold"), padx=10, pady=6)
+        self.catalog_parts_card.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 5))
 
-        tk.Label(self.catalog_tab,
-                 text="💡 Двойной клик по модели открывает её запчасти.\n"
-                      "Срок службы оборудования определяется запчастями (слабое звено).",
-                 fg="#6c757d", font=("Arial", 9), justify=tk.CENTER).pack(pady=5)
+        catalog_parts_toolbar = tk.Frame(self.catalog_parts_card)
+        catalog_parts_toolbar.pack(fill=tk.X, pady=(0, 4))
+        self._btn(catalog_parts_toolbar, "➕ Добавить запчасть", self._catalog_inline_add_part, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(catalog_parts_toolbar, "✏ Даты", self._catalog_inline_edit_dates, color='warning', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(catalog_parts_toolbar, "✏ Норма", self._catalog_inline_edit_norm, color='warning', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(catalog_parts_toolbar, "🔄 Заменяемая", self._catalog_inline_toggle_replaceable, color='info', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+        self._btn(catalog_parts_toolbar, "🗑 Удалить из состава", self._catalog_inline_remove_part, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
+
+        self.catalog_parts_effective = tk.Label(self.catalog_parts_card,
+                                                text="",
+                                                font=("Arial", 9, "bold"), fg="#546E7A")
+        self.catalog_parts_effective.pack(anchor=tk.W, pady=(0, 4))
+
+        cpf = tk.Frame(self.catalog_parts_card)
+        cpf.pack(fill=tk.BOTH, expand=True)
+        cat_cols = ("ID", "Запчасть", "Обозначение", "Замен.", "Дата установки / замены", "Остаток")
+        self.catalog_parts_tree = ttk.Treeview(cpf, columns=cat_cols, show="headings", height=6)
+        cat_w = {"ID": 40, "Запчасть": 280, "Обозначение": 200, "Замен.": 55,
+                 "Дата установки / замены": 160, "Остаток": 120}
+        for c in cat_cols:
+            self.catalog_parts_tree.heading(c, text=c)
+            self.catalog_parts_tree.column(c, width=cat_w.get(c, 100))
+        cvsb = ttk.Scrollbar(cpf, orient=tk.VERTICAL, command=self.catalog_parts_tree.yview)
+        self.catalog_parts_tree.configure(yscrollcommand=cvsb.set)
+        self.catalog_parts_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cvsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Выбор строки или двойной клик — показать запчасти модели
+        self.catalog_tree.bind('<<TreeviewSelect>>', lambda e: self._catalog_show_parts())
+        self.catalog_tree.bind('<Double-1>', lambda e: self._catalog_show_parts())
 
     def _is_catalog_grp_name(self, name: str) -> bool:
         """Признак служебного ГРП-каталога (не выводится в списке ГРП)."""
@@ -599,9 +948,9 @@ class GRPAppPG:
                 template = matches[0]
         if not template:
             return 0
-        parts = self.db.get_equipment_parts(template[0])
+        parts = self.db.get_equipment_parts_full(template[0])
         for part in parts:
-            self.db.add_equipment_part(equipment_id, part[1], None, None)
+            self.db.add_equipment_part(equipment_id, part[1], None, None, part[6])
         return len(parts)
 
     def _catalog_grp_id(self) -> Optional[int]:
@@ -628,7 +977,7 @@ class GRPAppPG:
         for e in equipment:
             equip = self._to_equipment_list([e])[0]
             norm = self._parts_aware_norm(equip)
-            norm_view = f"{norm:.1f} лет" if norm else "—"
+            norm_view = years_to_text(norm) if norm else "—"
             self.catalog_tree.insert('', tk.END, values=(
                 e[0], e[1], norm_view, len(self.db.get_equipment_parts(e[0]))
             ))
@@ -637,9 +986,9 @@ class GRPAppPG:
     def import_catalog_pdf(self):
         """Загрузка PDF-альбома: парсинг и добавление оборудования + запчастей."""
         try:
-            from pdf_parts_import import scan_pdf, import_to_db, create_catalog_equipment
+            from integration.pdf_parts_import import scan_pdf, import_to_db, create_catalog_equipment
         except ImportError:
-            messagebox.showerror("Ошибка", "Модуль pdf_parts_import не найден")
+            messagebox.showerror("Ошибка", "Модуль integration.pdf_parts_import не найден")
             return
 
         filename = filedialog.askopenfilename(
@@ -723,236 +1072,132 @@ class GRPAppPG:
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
 
-    def _catalog_open_parts(self):
+    def _catalog_show_parts(self):
+        """Показать запчасти выбранной модели в встроенной панели каталога."""
         selected = self.catalog_tree.selection()
         if not selected:
-            messagebox.showwarning("Внимание", "Выберите оборудование в каталоге!")
             return
         values = self.catalog_tree.item(selected[0])['values']
-        # В каталоге дата установки не задаётся — срок определяется запчастями
-        self.equipment_parts_window(int(values[0]), values[1], None)
+        self._catalog_refresh_parts(int(values[0]), values[1])
 
-    def equipment_parts_window(self, equip_id: int, equip_name: str, equip_install: str):
-        """Окно управления составом оборудования из запчастей."""
-        window = Toplevel(self.root)
-        window.title(f"🔩 Запчасти: {equip_name}")
-        window.geometry("850x620")
-        window.transient(self.root)
-        window.grab_set()
+    def _catalog_refresh_parts(self, equip_id: int, equip_name: str):
+        """Заполнение нижней панели каталога запчастями модели."""
+        for row in self.catalog_parts_tree.get_children():
+            self.catalog_parts_tree.delete(row)
 
-        tk.Label(window, text=f"🔩 Состав оборудования: {equip_name}",
-         font=("Arial", 12, "bold")).pack(pady=10)
-        if equip_install:
-            tk.Label(window, text=f"Установлено: {equip_install}", font=("Arial", 9), fg="#6c757d").pack()
+        self.catalog_parts_card.config(text=f"🔩 Запчасти модели: {equip_name}")
+        parts = self.db.get_equipment_parts_full(equip_id)
+        for ep in parts:
+            if ep[5]:  # история замен — не показываем
+                continue
+            zam = "✓" if ep[7] else "—"
+            inst_date = ep[4]
+            # Модель каталога — шаблон без даты установки, поэтому отсчёт
+            # срока детали здесь невозможен (в ГРП он идёт от даты
+            # установки оборудования).
+            rem = self._part_remaining_life(ep[4], None, ep[3])
+            ost = years_to_text(rem) if rem is not None else "—"
+            self.catalog_parts_tree.insert('', tk.END, values=(
+                ep[0], ep[2], ep[6] or "", zam, inst_date or "—", ost))
+        if parts:
+            self.catalog_parts_effective.config(
+                text=f"📋 Запчастей: {len(parts)} · норма: заменяемые — 5 лет, "
+                     f"остальные — 20 лет. Срок считается от даты установки "
+                     f"оборудования в ГРП.",
+                fg="#546E7A")
+        else:
+            self.catalog_parts_effective.config(
+                text="💡 Запчастей нет",
+                fg="#6c757d")
 
-        self.effective_label = tk.Label(window, text="", font=("Arial", 10, "bold"), fg="#546E7A")
-        self.effective_label.pack()
+    def _catalog_selected_equip(self):
+        """Выбранная модель каталога: (equip_id, name) или None."""
+        selected = self.catalog_tree.selection()
+        if not selected:
+            messagebox.showwarning("Внимание", "Выберите модель в каталоге!")
+            return None
+        values = self.catalog_tree.item(selected[0])['values']
+        return (int(values[0]), values[1])
 
-        table_frame = tk.Frame(window)
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    def _catalog_selected_part(self):
+        """Выбранная запчасть модели: (ep_id, name) или None."""
+        sel = self.catalog_parts_tree.selection()
+        if not sel:
+            messagebox.showwarning("Внимание", "Сначала выберите запчасть в списке!")
+            return None
+        values = self.catalog_parts_tree.item(sel[0])['values']
+        return (int(values[0]), values[1])
 
-        columns = ("ID", "Запчасть", "Норма (лет)", "Установлена", "Снята")
-        tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+    def _catalog_inline_add_part(self):
+        sel = self._catalog_selected_equip()
+        if sel is None:
+            return
+        equip_id, equip_name = sel
+        self._add_equipment_part_dialog(equip_id, None)
+        self._catalog_refresh_parts(equip_id, equip_name)
 
-        col_widths = {"ID": 40, "Запчасть": 330, "Норма (лет)": 100, "Установлена": 120, "Снята": 120}
-        for col in columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=col_widths.get(col, 100))
+    def _catalog_inline_edit_dates(self):
+        sel = self._catalog_selected_equip()
+        if sel is None:
+            return
+        equip_id, equip_name = sel
+        part = self._catalog_selected_part()
+        if part is None:
+            return
+        ep_id, name = part
+        ep_data = next((ep for ep in self.db.get_equipment_parts_full(equip_id) if ep[0] == ep_id), None)
+        if not ep_data:
+            return
+        self._edit_part_dates_dialog(equip_id, ep_id, name, None, ep_data)
+        self._catalog_refresh_parts(equip_id, equip_name)
 
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    def _catalog_inline_edit_norm(self):
+        sel = self._catalog_selected_equip()
+        if sel is None:
+            return
+        equip_id, equip_name = sel
+        part = self._catalog_selected_part()
+        if part is None:
+            return
+        ep_id, name = part
+        ep_data = next((ep for ep in self.db.get_equipment_parts_full(equip_id) if ep[0] == ep_id), None)
+        if not ep_data:
+            return
+        self._edit_part_norm_dialog(ep_data)
+        self._catalog_refresh_parts(equip_id, equip_name)
 
-        def refresh():
-            for row in tree.get_children():
-                tree.delete(row)
-            for ep in self.db.get_equipment_parts(equip_id):
-                # (ep_id, part_id, name, norm_years, install_date, removal_date)
-                install_view = ep[4] if ep[4] else (
-                    f"по умолчанию" if not equip_install else f"по умолч. ({equip_install})")
-                removal_view = ep[5] if ep[5] else ""
-                tree.insert('', tk.END, values=(ep[0], ep[2], ep[3], install_view, removal_view))
+    def _catalog_inline_toggle_replaceable(self):
+        sel = self._catalog_selected_equip()
+        if sel is None:
+            return
+        equip_id, equip_name = sel
+        part = self._catalog_selected_part()
+        if part is None:
+            return
+        ep_id, name = part
+        ep_data = next((ep for ep in self.db.get_equipment_parts_full(equip_id) if ep[0] == ep_id), None)
+        if not ep_data:
+            return
+        self.db.update_part_replaceable(ep_data[1], not ep_data[7])
+        self._catalog_refresh_parts(equip_id, equip_name)
+        part_row = self.db.get_part_by_name(ep_data[2])
+        self.statusbar.config(text=f"Запчасть '{ep_data[2]}' — {'заменяемая (5 лет)' if part_row[3] else 'не заменяемая'}")
 
-            remaining = self.doc_analyzer.get_remaining_life(equip_id, equip_install)
-            if remaining is not None:
-                state = ""
-                if remaining < 0:
-                    state = f" — ⚠️ ПРОСРОЧЕНО на {-remaining:.1f} лет"
-                elif remaining < 1:
-                    state = f" — ⚠️ осталось меньше года"
-                self.effective_label.config(
-                    text=f"📆 Срок оборудования (мин. остаток по запчастям): {remaining:.1f} лет{state}")
-            else:
-                self.effective_label.config(text="💡 Запчастей нет — внесите оборудование (тогда появится срок)")
+    def _catalog_inline_remove_part(self):
+        sel = self._catalog_selected_equip()
+        if sel is None:
+            return
+        equip_id, equip_name = sel
+        part = self._catalog_selected_part()
+        if part is None:
+            return
+        ep_id, name = part
+        if messagebox.askyesno("Подтверждение", f"Удалить '{name}' из состава модели?"):
+            self.db.remove_equipment_part(ep_id)
+            self._catalog_refresh_parts(equip_id, equip_name)
 
-        def add_link():
-            def do_add():
-                selection = part_combo.get()
-                if not selection:
-                    messagebox.showwarning("Внимание", "Выберите запчасть!")
-                    return
-                part_id = int(selection.split(" - ")[0])
-                self.db.add_equipment_part(
-                    equip_id, part_id,
-                    p_install.get().strip() or None,
-                    p_removal.get().strip() or None
-                )
-                add_window.destroy()
-                refresh()
-
-            all_parts = self.db.get_all_parts()
-            if not all_parts:
-                messagebox.showwarning("Внимание",
-                                       "Справочник запчастей пуст. Добавьте запчасти на вкладке '🔩 Запчасти'.")
-                return
-
-            add_window = Toplevel(window)
-            add_window.title("Добавить запчасть")
-            add_window.geometry("460x260")
-            add_window.transient(window)
-            add_window.grab_set()
-
-            tk.Label(add_window, text="➕ Добавление запчасти в состав",
-                     font=("Arial", 12, "bold")).pack(pady=10)
-
-            frame = tk.Frame(add_window)
-            frame.pack(pady=8)
-
-            tk.Label(frame, text="Запчасть:", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
-            part_combo = ttk.Combobox(frame, width=42,
-                                      values=[f"{p[0]} - {p[1]} ({p[2]} лет)" for p in all_parts])
-            part_combo.grid(row=0, column=1, pady=5)
-
-            tk.Label(frame, text="Дата установки:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
-            p_install = tk.Entry(frame, width=25)
-            p_install.grid(row=1, column=1, sticky=tk.W, pady=5)
-            tk.Label(frame, text="пусто = как у оборудования", font=("Arial", 8), fg="#6c757d").grid(row=2, column=1, sticky=tk.W)
-
-            tk.Label(frame, text="Дата снятия:", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
-            p_removal = tk.Entry(frame, width=25)
-            p_removal.grid(row=3, column=1, sticky=tk.W, pady=5)
-
-            btn_frame = tk.Frame(add_window)
-            btn_frame.pack(pady=12)
-            self._btn(btn_frame, "💾 Добавить", do_add, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
-            self._btn(btn_frame, "❌ Отмена", add_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
-
-        def edit_link():
-            selected_item = tree.selection()
-            if not selected_item:
-                messagebox.showwarning("Внимание", "Выберите запчасть из списка!")
-                return
-            values = tree.item(selected_item[0])['values']
-            ep_id = int(values[0])
-
-            ep_data = next((ep for ep in self.db.get_equipment_parts(equip_id) if ep[0] == ep_id), None)
-            if not ep_data:
-                return
-            default_install = equip_install if not ep_data[4] else ep_data[4]
-
-            edit_window = Toplevel(window)
-            edit_window.title("Изменить даты запчасти")
-            edit_window.geometry("440x220")
-            edit_window.transient(window)
-            edit_window.grab_set()
-
-            tk.Label(edit_window, text=f"✏ Изменение дат: {ep_data[2]}",
-                     font=("Arial", 12, "bold")).pack(pady=10)
-
-            frame = tk.Frame(edit_window)
-            frame.pack(pady=8)
-
-            install_entry = tk.Entry(frame, width=25)
-            removal_entry = tk.Entry(frame, width=25)
-            install_entry.insert(0, default_install)
-            if ep_data[5]:
-                removal_entry.insert(0, ep_data[5])
-
-            tk.Label(frame, text="Дата установки:", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
-            install_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
-            tk.Label(frame, text="Дата снятия:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
-            removal_entry.grid(row=1, column=1, sticky=tk.W, pady=5)
-
-            def save():
-                self.db.update_equipment_part(
-                    ep_id,
-                    install_entry.get().strip() or None,
-                    removal_entry.get().strip() or None
-                )
-                edit_window.destroy()
-                refresh()
-
-            btn_frame = tk.Frame(edit_window)
-            btn_frame.pack(pady=12)
-            self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
-            self._btn(btn_frame, "❌ Отмена", edit_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
-
-        def remove_link():
-            selected_item = tree.selection()
-            if not selected_item:
-                messagebox.showwarning("Внимание", "Выберите запчасть из списка!")
-                return
-            values = tree.item(selected_item[0])['values']
-            if messagebox.askyesno("Подтверждение", f"Удалить '{values[1]}' из состава оборудования?"):
-                self.db.remove_equipment_part(int(values[0]))
-                refresh()
-
-        def edit_norm():
-            selected_item = tree.selection()
-            if not selected_item:
-                messagebox.showwarning("Внимание", "Выберите запчасть из списка!")
-                return
-            values = tree.item(selected_item[0])['values']
-            ep_id = int(values[0])
-            ep_data = next((ep for ep in self.db.get_equipment_parts(equip_id) if ep[0] == ep_id), None)
-            if not ep_data:
-                return
-
-            norm_window = Toplevel(window)
-            norm_window.title("Изменить норму запчасти")
-            norm_window.geometry("440x190")
-            norm_window.transient(window)
-            norm_window.grab_set()
-
-            tk.Label(norm_window, text=f"✏ Норма запчасти: {ep_data[2]}",
-                     font=("Arial", 12, "bold")).pack(pady=10)
-
-            frame = tk.Frame(norm_window)
-            frame.pack(pady=8)
-
-            tk.Label(frame, text="Срок службы (лет):", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
-            years_entry = tk.Entry(frame, width=12)
-            years_entry.insert(0, str(ep_data[3]))
-            years_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
-
-            def save_norm():
-                try:
-                    years = float(years_entry.get())
-                    if years <= 0:
-                        raise ValueError
-                    self.db.update_part(ep_data[1], ep_data[2], years)
-                    norm_window.destroy()
-                    refresh()
-                    self.statusbar.config(text=f"Норма '{ep_data[2]}' = {years} лет")
-                except ValueError:
-                    messagebox.showerror("Ошибка", "Неверный формат числа!")
-
-            btn_frame = tk.Frame(norm_window)
-            btn_frame.pack(pady=12)
-            self._btn(btn_frame, "💾 Сохранить", save_norm, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
-            self._btn(btn_frame, "❌ Отмена", norm_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
-
-        btn_frame = tk.Frame(window)
-        btn_frame.pack(pady=10)
-
-        self._btn(btn_frame, "➕ Добавить запчасть", add_link, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "✏ Изменить даты", edit_link, color='warning', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "✏ Норма", edit_norm, color='warning', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "🗑 Удалить из состава", remove_link, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "✖ Закрыть", window.destroy, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-
-        refresh()
+    def _catalog_open_parts(self):
+        self._catalog_show_parts()
 
     def setup_replacements_tab(self):
         select_frame = tk.Frame(self.repairs_tab)
@@ -1099,6 +1344,272 @@ class GRPAppPG:
         if grp is None:
             return
         self._replacement_dialog(grp[0], grp[1])
+
+    def replace_part(self):
+        """Замена запчасти: дата + физ. замена детали в составе оборудования
+        и строка в журнале замен (Excel в формате М.ГГГГ)."""
+        grp = self._current_grp()
+        if grp is None:
+            return
+        self._replace_part_dialog(grp[0], grp[1])
+
+    @staticmethod
+    def _to_iso_date(value: str) -> Optional[str]:
+        """'ДД.ММ.ГГГГ' / 'ММ.ГГГГ' → 'ГГГГ-ММ-ДД' (для дат запчастей)."""
+        value = (value or '').strip()
+        m = re.match(r'^(\d{1,2})[.\-](\d{1,2})[.\-](\d{2,4})', value)
+        if m:
+            day, month, year = int(m.group(1)), int(m.group(2)), m.group(3)
+            if len(year) == 2:
+                year = '20' + year
+            return f'{year}-{month:02d}-{day:02d}'
+        m = re.match(r'^(\d{1,2})[.\-](\d{2,4})$', value)
+        if m:
+            month, year = int(m.group(1)), m.group(2)
+            if len(year) == 2:
+                year = '20' + year
+            return f'{year}-{month:02d}-01'
+        return None
+
+    @staticmethod
+    def _equipment_type_by_model(model: str) -> str:
+        low = (model or '').lower()
+        if 'пск' in low or 'сбросн' in low:
+            return 'ПСК'
+        if 'пзк' in low or 'запорн' in low:
+            return 'ПЗК'
+        if 'фильтр' in low:
+            return 'Фильтр'
+        return 'Регулятор'
+
+    def _replace_part_dialog(self, grp_id: int, grp_name: str):
+        window = Toplevel(self.root)
+        window.title(f"🔧 Замена запчасти — ГРП {grp_name}")
+        window.geometry("980x640")
+        window.transient(self.root)
+        window.grab_set()
+
+        tk.Label(window, text=f"🔧 Замена запасной части\nГРП #{grp_id}: {grp_name}",
+                 font=("Arial", 12, "bold")).pack(pady=6)
+
+        equipment = self.db.get_equipment_by_grp(grp_id)
+        if not equipment:
+            messagebox.showwarning("Внимание", "У ГРП нет оборудования.")
+            window.destroy()
+            return
+
+        main = tk.Frame(window)
+        main.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_columnconfigure(1, weight=2)
+        main.grid_rowconfigure(0, weight=1)
+
+        # === Слева: список оборудования ===
+        left = tk.LabelFrame(main, text="📦 Оборудование",
+                             font=("Arial", 10, "bold"), padx=6, pady=4)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+
+        eq_tree = ttk.Treeview(left, columns=("n", "d"), show="headings", height=12)
+        eq_tree.heading("n", text="Наименование")
+        eq_tree.heading("d", text="Установлено")
+        eq_tree.column("n", width=230, anchor=tk.W)
+        eq_tree.column("d", width=90, anchor=tk.CENTER)
+        eq_tree.pack(fill=tk.BOTH, expand=True)
+
+        # === Справа: запчасти оборудования ===
+        right = tk.LabelFrame(main, text="🔩 Запчасти оборудования",
+                              font=("Arial", 10, "bold"), padx=6, pady=4)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        cols = ("ID", "Запчасть", "Обозначение", "Замен.", "Остаток", "Норма")
+        parts_tree = ttk.Treeview(right, columns=cols, show="headings", height=12)
+        widths = {"ID": 40, "Запчасть": 200, "Обозначение": 110, "Замен.": 55,
+                  "Остаток": 115, "Норма": 90}
+        for c in cols:
+            parts_tree.heading(c, text=c)
+            parts_tree.column(c, width=widths[c], anchor=tk.W)
+        parts_tree.pack(fill=tk.BOTH, expand=True)
+
+        # === Форма: запись о замене (журнал) ===
+        form = tk.LabelFrame(window, text="📝 Запись о замене (журнал)",
+                             font=("Arial", 10, "bold"), padx=10, pady=6)
+        form.pack(fill=tk.X, padx=10, pady=4)
+
+        sel_info = tk.Label(form, text="",
+                            font=("Arial", 9, "bold"), fg="#546E7A", anchor=tk.W)
+        sel_info.grid(row=0, column=0, columnspan=6, sticky=tk.W, pady=(0, 6))
+
+        def fctrl(row, col, label, widget):
+            tk.Label(form, text=label, font=("Arial", 9)).grid(row=row, column=col, sticky=tk.E, padx=(4, 2), pady=3)
+            widget.grid(row=row, column=col + 1, sticky=tk.W, padx=(0, 8), pady=3)
+
+        date_entry = tk.Entry(form, width=12)
+        date_entry.insert(0, datetime.now().strftime('%d.%m.%Y'))
+        work_combo = ttk.Combobox(form, width=22, values=WORK_TYPES)
+        reason_entry = tk.Entry(form, width=32)
+        boss_entry = tk.Entry(form, width=28)
+
+        fctrl(1, 0, "Дата замены:", date_entry)
+        fctrl(1, 2, "Вид работ:", work_combo)
+        fctrl(2, 0, "Причина:", reason_entry)
+        fctrl(2, 2, "ФИО руководителя:", boss_entry)
+
+        parts = {}
+        current_eq = {"row": None}
+
+        def load_equipment_parts(eq):
+            current_eq["row"] = eq
+            for row in parts_tree.get_children():
+                parts_tree.delete(row)
+            parts.clear()
+            full = self.db.get_equipment_parts_full(eq[0])
+            for ep in full:
+                if ep[5]:  # снятая запись (история) — не показываем
+                    continue
+                ep_id, part_id, name, norm, p_install, _removal, pnum, is_repl = ep
+                parts[ep_id] = (eq, part_id, name, norm, pnum or "", is_repl)
+                rem = self._part_remaining_life(p_install, eq[2], norm)
+                parts_tree.insert('', tk.END, values=(
+                    ep_id, name, pnum or "", "✓" if is_repl else "—",
+                    years_to_text(rem) if rem is not None else "—",
+                    years_to_text(norm)))
+
+        def on_equipment_select(_event=None):
+            sel = eq_tree.selection()
+            if not sel:
+                return
+            eq = equipment[eq_tree.index(sel[0])]
+            load_equipment_parts(eq)
+            self.statusbar.config(text=f"Замена запчасти: оборудование «{eq[1]}»")
+
+        def on_part_select(_event=None):
+            sel = parts_tree.selection()
+            if not sel:
+                return
+            ep_id = int(parts_tree.item(sel[0])['values'][0])
+            eq, _pid, _name, _norm, pnumber, is_repl = parts[ep_id]
+            sel_info.config(text=f"Выбрано: {_name}  ·  обозначение: {pnumber or '—'}  ·  оборудование: {eq[1]}")
+            self.statusbar.config(text=f"Деталь «{_name}» — {'заменяемая ✓' if is_repl else 'НЕ заменяемая'}")
+
+        eq_tree.bind('<<TreeviewSelect>>', on_equipment_select)
+        parts_tree.bind('<<TreeviewSelect>>', on_part_select)
+
+        for eq in equipment:
+            eq_tree.insert('', tk.END, values=(eq[1], eq[2] or "—"))
+        if equipment:
+            eq_tree.selection_set(eq_tree.get_children()[0])
+            load_equipment_parts(equipment[0])
+
+        def save():
+            sel = parts_tree.selection()
+            if not sel:
+                messagebox.showwarning("Внимание", "Сначала выберите запчасть в списке!")
+                return
+            ep_id = int(parts_tree.item(sel[0])['values'][0])
+            eq, part_id, name, norm, pnumber, is_repl = parts[ep_id]
+            if not is_repl:
+                messagebox.showerror(
+                    "Ошибка",
+                    f"Деталь «{name}» НЕ заменяемая.\n\n"
+                    "Заменять можно только детали, отмеченные «✓» "
+                    "(в «Запчастях оборудования» кнопка «🔄 Заменяемая»).")
+                return
+            num = pnumber
+            date_input = date_entry.get().strip()
+            iso = self._to_iso_date(date_input)
+            if not iso:
+                messagebox.showerror("Ошибка", "Неверная дата. Формат: ДД.ММ.ГГГГ или ММ.ГГГГ")
+                return
+            data = (
+                date_input or None,
+                num or None,
+                self._equipment_type_by_model(eq[1]),
+                eq[1],
+                None,
+                work_combo.get().strip() or None,
+                reason_entry.get().strip() or None,
+                boss_entry.get().strip() or None,
+            )
+            try:
+                self.db.replace_equipment_part(eq[0], part_id, iso)
+                self.db.add_replacement(grp_id, *data)
+                load_equipment_parts(eq)
+                self.load_home()
+                self.load_replacements()
+                self.sync_excel(silent=True)
+                self.statusbar.config(text=f"Замена «{name}» от {date_input} — новый срок {years_to_text(norm)}")
+                messagebox.showinfo("✅ Замена выполнена",
+                                    f"Деталь «{name}» заменена на такую же новую.\n\n"
+                                    f"Дата установки (замены): {date_input}\n"
+                                    f"Новый срок службы: {years_to_text(norm)} — снова с этой даты.")
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+
+        def replace_whole_equipment():
+            """Полная замена оборудования: сроки всех его деталей — заново."""
+            sel = eq_tree.selection()
+            if not sel:
+                messagebox.showwarning("Внимание", "Сначала выберите оборудование!")
+                return
+            eq = equipment[eq_tree.index(sel[0])]
+            eq_id = eq[0]
+
+            date_input = date_entry.get().strip()
+            iso = self._to_iso_date(date_input)
+            if not iso:
+                messagebox.showerror("Ошибка", "Неверная дата. Формат: ДД.ММ.ГГГГ или ММ.ГГГГ")
+                return
+
+            active = [p for p in self.db.get_equipment_parts_full(eq_id)
+                      if not p[5]]
+            norm_list = '\n'.join(
+                f'  • {p[2]} — {years_to_text(p[3])} (срок заново с {date_input})'
+                for p in active) or '  • состав деталей не заполнен'
+
+            if not messagebox.askyesno(
+                    "Подтверждение полной замены",
+                    f"Оборудование «{eq[1]}» будет полностью заменено "
+                    f"{date_input}.\n\n"
+                    f"Прежнее оборудование и все его детали будут сняты "
+                    f"с эксплуатации этой датой. Будет создано новое "
+                    f"оборудование с датой установки {date_input}, и срок службы "
+                    f"каждой детали начнётся заново:\n\n{norm_list}\n\n"
+                    f"Прежняя история деталей сохранится. Продолжить?"):
+                return
+
+            try:
+                new_id = self.db.replace_equipment_completely(
+                    eq_id, iso,
+                    equipment_type=self._equipment_type_by_model(eq[1]),
+                    work_type=work_combo.get().strip() or 'Замена',
+                    reason=reason_entry.get().strip() or None,
+                    supervisor=boss_entry.get().strip() or None,
+                    grp_id=grp_id)
+                self.load_home()
+                self.load_replacements()
+                self.sync_excel(silent=True)
+                self.statusbar.config(
+                    text=f"Оборудование «{eq[1]}» полностью заменено "
+                         f"{date_input} — сроки деталей с новой даты")
+                messagebox.showinfo(
+                    "✅ Оборудование заменено",
+                    f"«{eq[1]}» полностью заменено {date_input}.\n\n"
+                    f"Прежнее оборудование и его детали сняты с эксплуатации.\n"
+                    f"Создано новое оборудование (ID {new_id}) с датой установки "
+                    f"{date_input}.\n\n"
+                    f"Срок службы всех {len(active)} деталей отсчитывается заново "
+                    f"от этой даты.")
+                window.destroy()
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+
+        btn_frame = tk.Frame(window)
+        btn_frame.pack(pady=8)
+        self._btn(btn_frame, "💾 Заменить деталь", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=8)
+        self._btn(btn_frame, "🔄 Заменить оборудование полностью",
+                  replace_whole_equipment, color='primary', font_size=10,
+                  padx=20).pack(side=tk.LEFT, padx=8)
+        self._btn(btn_frame, "❌ Закрыть", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=8)
 
     def edit_replacement(self):
         grp = self._current_grp()
@@ -1415,109 +1926,15 @@ class GRPAppPG:
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
 
     def view_equipment(self):
-        grp = self._current_grp()
-        if grp is None:
+        """Показать оборудование и запчасти в главном окне (выбранный ГРП)."""
+        if self._current_grp() is None:
             return
+        self.show_view("grp")
+        self.load_home()
+        self.statusbar.config(text=f"Оборудование и запчасти ГРП «{self.current_grp_name}»")
 
-        grp_id = grp[0]
-        grp_name = grp[1]
-
-        equipment = self.db.get_equipment_by_grp(grp_id)
-
-        window = Toplevel(self.root)
-        window.title(f"Оборудование ГРП: {grp_name}")
-        window.geometry("850x550")
-        window.transient(self.root)
-
-        if not equipment:
-            tk.Label(window, text="❌ Нет оборудования для данного ГРП",
-                     font=("Arial", 14), fg="red").pack(pady=50)
-            self._btn(window, "✖ Закрыть", window.destroy, color='danger', font_size=10, padx=20).pack(pady=10)
-            return
-
-        tk.Label(window, text=f"📋 Оборудование ГРП: {grp_name}",
-                 font=("Arial", 14, "bold")).pack(pady=10)
-
-        columns = ("ID", "Наименование", "Дата установки", "Дата снятия")
-        tree = ttk.Treeview(window, columns=columns, show="headings", height=15)
-
-        col_widths = {"ID": 50, "Наименование": 350, "Дата установки": 150, "Дата снятия": 150}
-        for col in columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=col_widths.get(col, 150))
-
-        for equip in equipment:
-            status = equip[3] if equip[3] else "✅ В эксплуатации"
-            tree.insert('', tk.END, values=(equip[0], equip[1], equip[2], status))
-
-        scrollbar = ttk.Scrollbar(window, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        btn_frame = tk.Frame(window)
-        btn_frame.pack(pady=10)
-
-        def check_selected_norms():
-            selected_item = tree.selection()
-            if selected_item:
-                equip_data = tree.item(selected_item[0])['values']
-                equip_id = int(equip_data[0])
-                equip_name = equip_data[1]
-                install_date = equip_data[2]
-
-                remaining = self.doc_analyzer.get_remaining_life(equip_id, install_date)
-                if remaining is not None:
-                    if remaining < 0:
-                        status = "❌ СРОК ИСТЁК, требуется замена!"
-                        note = f"⚠️ Просрочено на {-remaining:.1f} лет"
-                    elif remaining < 1:
-                        status = "⚠️ Требует внимания"
-                        note = f"⏰ Осталось {remaining:.1f} лет ({remaining*12:.0f} мес.)"
-                    else:
-                        status = "✅ В пределах срока"
-                        note = f"⏰ Остаток {remaining:.1f} лет"
-                    messagebox.showinfo("Проверка срока",
-                                        f"📌 Оборудование: {equip_name}\n"
-                                        f"📅 Установлено: {install_date}\n"
-                                        f"🔧 Срок определяется по запчастям\n"
-                                        f"📆 Мин. остаток среди запчастей: {remaining:.1f} лет\n"
-                                        f"📊 Статус: {status}\n({note})")
-                else:
-                    messagebox.showwarning("Нет запчастей", f"Для '{equip_name}' нет запчастей.\n"
-                                                            f"Срока у оборудования нет.\n"
-                                                            f"Внесите оборудование (запчасти), чтобы появился срок.")
-
-        def delete_selected():
-            selected_item = tree.selection()
-            if not selected_item:
-                messagebox.showwarning("Внимание", "Выберите оборудование для удаления!")
-                return
-
-            equip_id = tree.item(selected_item[0])['values'][0]
-            equip_name = tree.item(selected_item[0])['values'][1]
-
-            if messagebox.askyesno("Подтверждение", f"Удалить оборудование '{equip_name}'?"):
-                self.db.delete_equipment(equip_id)
-                window.destroy()
-                self.load_home()
-                self.statusbar.config(text=f"Оборудование '{equip_name}' удалено")
-
-        def open_parts():
-            selected_item = tree.selection()
-            if not selected_item:
-                messagebox.showwarning("Внимание", "Выберите оборудование!")
-                return
-            equip_data = tree.item(selected_item[0])['values']
-            self.equipment_parts_window(int(equip_data[0]), equip_data[1], equip_data[2])
-
-        self._btn(btn_frame, "🔍 Проверить по нормам", check_selected_norms, color='info', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "🔩 Запчасти", open_parts, color='brown', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "🗑 Удалить оборудование", delete_selected, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-        self._btn(btn_frame, "✖ Закрыть", window.destroy, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-
-    def documentary_analysis(self):
+    def export_grp_word(self):
+        """Сформировать отчёт по текущему ГРП в формате Word (.docx)."""
         grp = self._current_grp()
         if grp is None:
             return
@@ -1526,51 +1943,25 @@ class GRPAppPG:
         grp_name = grp[1]
 
         equipment_data = self.db.get_equipment_by_grp(grp_id)
-
         if not equipment_data:
-            messagebox.showinfo("Информация", "У данного ГРП нет оборудования для анализа")
+            messagebox.showinfo("Информация", "У данного ГРП нет оборудования для отчёта")
             return
 
-        equipment_list = self._to_equipment_list(equipment_data)
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".docx",
+            filetypes=[("Word документы", "*.docx")],
+            initialfile="Отчёт_ГРП.docx"
+        )
+        if not filename:
+            return
 
         try:
-            report = self.doc_analyzer.generate_documentary_report(grp_id, grp_name, equipment_list)
-
-            window = Toplevel(self.root)
-            window.title(f"📄 Документальный анализ ГРП {grp_name}")
-            window.geometry("1100x800")
-            window.transient(self.root)
-
-            text_area = scrolledtext.ScrolledText(window, wrap=tk.WORD, font=("Courier", 9))
-            text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-            text_area.insert(tk.END, report)
-            text_area.config(state=tk.DISABLED)
-
-            def export_to_file():
-                filename = filedialog.asksaveasfilename(
-                    defaultextension=".txt",
-                    filetypes=[("Text files", "*.txt")],
-                    initialfile=f"doc_analysis_grp_{grp_id}_{datetime.now().strftime('%Y%m%d')}.txt"
-                )
-                if filename:
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write(report)
-                    messagebox.showinfo("Успех", f"Отчет сохранен в:\n{filename}")
-
-            btn_frame = tk.Frame(window)
-            btn_frame.pack(pady=10)
-
-            self._btn(btn_frame, "💾 Сохранить отчет", export_to_file, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-            self._btn(btn_frame, "📋 Копировать", lambda: (window.clipboard_clear(), window.clipboard_append(report),
-                                       messagebox.showinfo("Успех", "Отчет скопирован в буфер обмена")), color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-            self._btn(btn_frame, "✖ Закрыть", window.destroy, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-
-            self.statusbar.config(text=f"Документальный анализ для ГРП {grp_name} выполнен")
-
+            saved = word_report_pg.generate_grp_docx(
+                self.db, self.doc_analyzer, grp_id, grp_name, filename)
+            messagebox.showinfo("Успех", f"Отчёт по ГРП «{grp_name}» сохранён:\n{saved}")
+            self.statusbar.config(text=f"Word-отчёт по ГРП {grp_name} сохранён")
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Ошибка при выполнении анализа:\n{str(e)}")
-            self.statusbar.config(text=f"Ошибка: {str(e)}")
+            messagebox.showerror("Ошибка", f"Не удалось сформировать отчёт:\n{e}")
 
     def show_warnings(self):
         grp = self._current_grp()
@@ -1612,8 +2003,8 @@ class GRPAppPG:
             for p in problems['overdue']:
                 text_area.insert(tk.END, f"\n🔴 {p['name']}\n")
                 text_area.insert(tk.END, f"   📅 Установлено: {p['install_date']}\n")
-                text_area.insert(tk.END, f"   📆 Мин. остаток по запчастям: {p['remaining']:.1f} лет\n")
-                text_area.insert(tk.END, f"   ⚠️ ПРОСРОЧЕНО на: {p['exceeded']:.1f} лет!\n")
+                text_area.insert(tk.END, f"   📆 Мин. остаток по запчастям: {years_to_text(p['remaining'])}\n")
+                text_area.insert(tk.END, f"   ⚠️ ПРОСРОЧЕНО на: {years_to_text(p['exceeded'])}!\n")
 
         if problems['near_limit']:
             text_area.insert(tk.END, "\n⚠️ ОБОРУДОВАНИЕ, У КОТОРОГО СРОК ИСТЕЧЁТ В ТЕЧЕНИЕ ГОДА:\n")
@@ -1621,7 +2012,7 @@ class GRPAppPG:
             for p in problems['near_limit']:
                 text_area.insert(tk.END, f"\n🟡 {p['name']}\n")
                 text_area.insert(tk.END, f"   📅 Установлено: {p['install_date']}\n")
-                text_area.insert(tk.END, f"   ⏰ Осталось по слабой запчасти: {p['left_years']:.1f} лет\n")
+                text_area.insert(tk.END, f"   ⏰ Осталось по слабой запчасти: {years_to_text(p['left_years'])}\n")
 
         if problems['no_data']:
             text_area.insert(tk.END, "\n❓ ОБОРУДОВАНИЕ БЕЗ ЗАПЧАСТЕЙ (СРОКА НЕТ):\n")
@@ -1647,146 +2038,6 @@ class GRPAppPG:
         btn_frame.pack(pady=10)
         self._btn(btn_frame, "💾 Сохранить", export_warnings, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
         self._btn(btn_frame, "✖ Закрыть", window.destroy, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-
-    def add_norm(self):
-        window = Toplevel(self.root)
-        window.title("Добавить документальную норму")
-        window.geometry("500x400")
-        window.transient(self.root)
-        window.grab_set()
-
-        tk.Label(window, text="📋 Добавление документальной нормы",
-                 font=("Arial", 14, "bold"), fg="#546E7A").pack(pady=10)
-
-        frame = tk.Frame(window)
-        frame.pack(pady=10)
-
-        tk.Label(frame, text="Наименование оборудования:", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
-        name_entry = tk.Entry(frame, width=40)
-        name_entry.grid(row=0, column=1, pady=5)
-
-        tk.Label(frame, text="Максимальный срок службы (лет):", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
-        years_entry = tk.Entry(frame, width=20)
-        years_entry.grid(row=1, column=1, pady=5)
-
-        tk.Label(frame, text="Примечания:", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
-        notes_entry = tk.Entry(frame, width=40)
-        notes_entry.grid(row=2, column=1, pady=5)
-
-        def save():
-            try:
-                name = name_entry.get().strip()
-                if not name:
-                    messagebox.showerror("Ошибка", "Введите наименование оборудования!")
-                    return
-
-                years = float(years_entry.get())
-                if years <= 0:
-                    messagebox.showerror("Ошибка", "Срок службы должен быть больше 0!")
-                    return
-
-                self.db.add_norm(name, years, notes_entry.get())
-                messagebox.showinfo("Успех", "✅ Норма добавлена!")
-                window.destroy()
-                self.refresh_norms_table()
-                self.statusbar.config(text=f"Добавлена норма для: {name}")
-            except ValueError:
-                messagebox.showerror("Ошибка", "Неверный формат числа!")
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
-
-        btn_frame = tk.Frame(window)
-        btn_frame.pack(pady=20)
-        self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
-        self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
-
-    def edit_norm(self):
-        selected = self.norms_tree.selection()
-        if not selected:
-            messagebox.showwarning("Внимание", "Выберите норму для редактирования!")
-            return
-
-        norm_id = self.norms_tree.item(selected[0])['values'][0]
-        norm = next((n for n in self.db.get_all_norms() if n[0] == norm_id), None)
-
-        if not norm:
-            return
-
-        window = Toplevel(self.root)
-        window.title("Редактировать норму")
-        window.geometry("500x400")
-        window.transient(self.root)
-        window.grab_set()
-
-        tk.Label(window, text="✏ Редактирование нормы",
-                 font=("Arial", 14, "bold"), fg="#546E7A").pack(pady=10)
-
-        frame = tk.Frame(window)
-        frame.pack(pady=10)
-
-        tk.Label(frame, text="Наименование оборудования:", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
-        name_entry = tk.Entry(frame, width=40)
-        name_entry.insert(0, norm[1])
-        name_entry.grid(row=0, column=1, pady=5)
-
-        tk.Label(frame, text="Максимальный срок службы (лет):", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
-        years_entry = tk.Entry(frame, width=20)
-        years_entry.insert(0, str(norm[2]))
-        years_entry.grid(row=1, column=1, pady=5)
-
-        tk.Label(frame, text="Примечания:", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
-        notes_entry = tk.Entry(frame, width=40)
-        notes_entry.insert(0, norm[3] if norm[3] else "")
-        notes_entry.grid(row=2, column=1, pady=5)
-
-        def save():
-            try:
-                name = name_entry.get().strip()
-                if not name:
-                    messagebox.showerror("Ошибка", "Введите наименование оборудования!")
-                    return
-
-                years = float(years_entry.get())
-                if years <= 0:
-                    messagebox.showerror("Ошибка", "Срок службы должен быть больше 0!")
-                    return
-
-                self.db.update_norm(norm_id, name, years, notes_entry.get())
-                messagebox.showinfo("Успех", "✅ Норма обновлена!")
-                window.destroy()
-                self.refresh_norms_table()
-                self.statusbar.config(text=f"Обновлена норма для: {name}")
-            except ValueError:
-                messagebox.showerror("Ошибка", "Неверный формат числа!")
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
-
-        btn_frame = tk.Frame(window)
-        btn_frame.pack(pady=20)
-        self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
-        self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
-
-    def delete_norm(self):
-        selected = self.norms_tree.selection()
-        if not selected:
-            messagebox.showwarning("Внимание", "Выберите норму для удаления!")
-            return
-
-        norm_id = self.norms_tree.item(selected[0])['values'][0]
-        norm_name = self.norms_tree.item(selected[0])['values'][1]
-
-        if messagebox.askyesno("Подтверждение", f"Удалить норму для '{norm_name}'?"):
-            self.db.delete_norm(norm_id)
-            messagebox.showinfo("Успех", "Норма удалена!")
-            self.refresh_norms_table()
-            self.statusbar.config(text=f"Удалена норма для: {norm_name}")
-
-    def refresh_norms_table(self):
-        for row in self.norms_tree.get_children():
-            self.norms_tree.delete(row)
-
-        for norm in self.db.get_all_norms():
-            self.norms_tree.insert('', tk.END, values=norm)
 
     def add_tech_diagnostic(self):
         grp = self._current_grp()
@@ -1946,11 +2197,11 @@ class GRPAppPG:
             return
 
         self.stats_text.insert(tk.END, f"📊 Количество образцов: {stats['count']} шт.\n")
-        self.stats_text.insert(tk.END, f"📈 СРЕДНЕЕ время жизни: {stats['mean']:.1f} мес. ({stats['mean']/12:.1f} лет)\n")
-        self.stats_text.insert(tk.END, f"📉 МЕДИАНА время жизни: {stats['median']:.1f} мес. ({stats['median']/12:.1f} лет)\n")
+        self.stats_text.insert(tk.END, f"📈 СРЕДНЕЕ время жизни: {stats['mean']:.1f} мес. ({years_to_text(stats['mean']/12)})\n")
+        self.stats_text.insert(tk.END, f"📉 МЕДИАНА время жизни: {stats['median']:.1f} мес. ({years_to_text(stats['median']/12)})\n")
         self.stats_text.insert(tk.END, f"📏 Стандартное отклонение: {stats['std']:.1f} мес.\n")
-        self.stats_text.insert(tk.END, f"🔽 Минимальное: {stats['min']:.1f} мес. ({stats['min']/12:.1f} лет)\n")
-        self.stats_text.insert(tk.END, f"🔼 Максимальное: {stats['max']:.1f} мес. ({stats['max']/12:.1f} лет)\n")
+        self.stats_text.insert(tk.END, f"🔽 Минимальное: {stats['min']:.1f} мес. ({years_to_text(stats['min']/12)})\n")
+        self.stats_text.insert(tk.END, f"🔼 Максимальное: {stats['max']:.1f} мес. ({years_to_text(stats['max']/12)})\n")
 
         self.statusbar.config(text=f"Статистика для ГРП #{grp_id} загружена")
 
@@ -2023,11 +2274,11 @@ class GRPAppPG:
             text_area.insert(tk.END, "=" * 80 + "\n\n")
 
             text_area.insert(tk.END, f"📊 Количество образцов: {stats['count']} шт.\n")
-            text_area.insert(tk.END, f"📈 СРЕДНЕЕ время жизни: {stats['mean']:.1f} мес. ({stats['mean']/12:.1f} лет)\n")
-            text_area.insert(tk.END, f"📉 МЕДИАНА время жизни: {stats['median']:.1f} мес. ({stats['median']/12:.1f} лет)\n")
+            text_area.insert(tk.END, f"📈 СРЕДНЕЕ время жизни: {stats['mean']:.1f} мес. ({years_to_text(stats['mean']/12)})\n")
+            text_area.insert(tk.END, f"📉 МЕДИАНА время жизни: {stats['median']:.1f} мес. ({years_to_text(stats['median']/12)})\n")
             text_area.insert(tk.END, f"📏 Стандартное отклонение: {stats['std']:.1f} мес.\n")
-            text_area.insert(tk.END, f"🔽 Минимальное: {stats['min']:.1f} мес. ({stats['min']/12:.1f} лет)\n")
-            text_area.insert(tk.END, f"🔼 Максимальное: {stats['max']:.1f} мес. ({stats['max']/12:.1f} лет)\n\n")
+            text_area.insert(tk.END, f"🔽 Минимальное: {stats['min']:.1f} мес. ({years_to_text(stats['min']/12)})\n")
+            text_area.insert(tk.END, f"🔼 Максимальное: {stats['max']:.1f} мес. ({years_to_text(stats['max']/12)})\n\n")
 
             if norm is None:
                 text_area.insert(tk.END, "❓ Для оборудования нет документальной нормы!\n\n")
@@ -2055,10 +2306,10 @@ class GRPAppPG:
 
                     text_area.insert(tk.END, f"{i:2d}. {equip.name}\n")
                     text_area.insert(tk.END, f"     📅 Установка: {equip.install_date} → {removal_info}\n")
-                    text_area.insert(tk.END, f"     ⏱ Время жизни: {lifetime:.1f} мес. ({lifetime_years:.1f} лет)  {status}\n\n")
+                    text_area.insert(tk.END, f"     ⏱ Время жизни: {lifetime:.1f} мес. ({years_to_text(lifetime_years)})  {status}\n\n")
 
             if norm:
-                text_area.insert(tk.END, f"\n📋 Документальная норма: {norm} лет\n")
+                text_area.insert(tk.END, f"\n📋 Документальная норма: {years_to_text(norm)}\n")
                 if stats['mean'] / 12 > norm:
                     text_area.insert(tk.END, "⚠️ СРЕДНЕЕ время жизни ПРЕВЫШАЕТ норму!\n")
                 elif stats['median'] / 12 > norm:
@@ -2125,7 +2376,7 @@ class GRPAppPG:
             return
 
         try:
-            from algorithms_view import AlgorithmsWindow
+            from .algorithms_view import AlgorithmsWindow
             AlgorithmsWindow(self.root, self.db, grp_id, equipment_data)
             self.statusbar.config(text=f"Открыт расчёт алгоритмов для ГРП: {grp_name}")
         except ImportError as e:
