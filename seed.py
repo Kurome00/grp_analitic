@@ -12,6 +12,7 @@
     замены. Срок заменяемой детали — 5 лет, самого оборудования — срок
     полной проверки (20 лет) по config.FULL_CHECK_TERM.
 """
+import os
 import sys
 from datetime import date
 
@@ -80,6 +81,7 @@ def align_part_norms():
 
 # Каталог-справочник (в нём шаблоны моделей со всеми запчастями)
 CATALOG_GRP_MARKER = 'каталог'
+CATALOG_GRP_NAME = 'Каталог оборудования'
 
 # Шаг сетки плановых замен заменяемых деталей, лет. Совпадает с их нормой.
 PART_RENEW_STEP_YEARS = 5
@@ -353,6 +355,41 @@ def _apply_replacements(db, equipment_id: int, renewed_date, fragments=None,
         db.update_equipment_part(ep_id, install_date=renewed_date)
 
 
+def ensure_catalog(db, from_pdf: bool = True):
+    """Гарантирует наличие каталога оборудования.
+
+    На чистой машине после git clone база пуста: без каталога нечего
+    привязывать к сценариям, и seed.py --demo молча создаёт ноль ГРП.
+    Поэтому при пустом каталоге альбом из docs/ импортируется автоматически
+    (парсинг 70-МБ PDF занимает несколько секунд).
+    """
+    templates = _catalog_templates(db)
+    if templates or not from_pdf:
+        return templates
+
+    from core.config import PROJECT_ROOT
+    pdf = os.path.join(PROJECT_ROOT, "docs", "Альбом запчастей по газу.pdf")
+    if not os.path.isfile(pdf):
+        print("[!] Каталог пуст, и нет docs/Альбом запчастей по газу.pdf —")
+        print("    импортируйте альбом вручную: меню «Справочники» →")
+        print("    «📂 Импорт из PDF-альбома»")
+        return templates
+
+    print("[*] Каталог оборудования пуст — импортирую альбом из docs/ …")
+    from integration import pdf_parts_import
+    units = pdf_parts_import.scan_pdf(pdf)
+    if not units:
+        print("[!] Не удалось прочитать альбом:", pdf)
+        return templates
+    pdf_parts_import.import_to_db(db, units, link_to_equipment=False)
+    pdf_parts_import.create_catalog_equipment(db, units, CATALOG_GRP_NAME)
+    pdf_parts_import.import_to_db(db, units, link_to_equipment=True)
+    templates = _catalog_templates(db)
+    print(f"[+] Каталог создан: единиц оборудования {len(units)}, "
+          f"моделей с запчастями {len(templates)}")
+    return templates
+
+
 def seed_examples():
     """Пересоздаёт демонстрационные ГРП по сценариям.
 
@@ -372,9 +409,9 @@ def seed_examples():
     if removed:
         print(f"[~] Удалено ГРП: {removed} (каталог сохранён)")
 
-    templates = _catalog_templates(db)
+    templates = ensure_catalog(db)
     if not templates:
-        print("[!] Каталог оборудования не найден — сначала импортируйте PDF-альбом")
+        print("[!] Демо-сценарии не созданы: нет каталога оборудования")
         return
 
     created = 0

@@ -18,6 +18,57 @@ class DatabasePG:
             self.init_db()
             DatabasePG._initialized = True
 
+    @staticmethod
+    def _error_text(exc: Exception) -> str:
+        """Текст ошибки PostgreSQL.
+
+        psycopg2 декодирует служебные сообщения сервера в кодировке клиента.
+        На части установок (Windows, не-UTF8 локаль) текст остаётся в
+        cp1251, и обычный str(exc) сам падает с UnicodeDecodeError, заменяя
+        исходную ошибку. Поэтому приводим текст безопасно, с заменой
+        нечитаемых байтов, — иначе пользователь видит «codec can't decode»
+        вместо причины.
+        """
+        try:
+            return str(exc)
+        except UnicodeDecodeError:
+            return exc.__class__.__name__ + ' (сообщение сервера в нечитаемой кодировке)'
+
+    def ensure_database_exists(self) -> bool:
+        """Создаёт базу из DB_CONFIG, если её ещё нет.
+
+        Нужна для свежей установки: после git clone базы grp_analyzer
+        на компьютере нет, и без этого шага приложение падает при старте.
+        Требуется право CREATEDB у пользователя из DB_CONFIG.
+        """
+        dbname = self.db_config.get('database')
+        if not dbname:
+            return False
+        try:
+            probe = psycopg2.connect(**self.db_config)
+            probe.close()
+            return False          # база уже есть — ничего создавать не нужно
+        except (psycopg2.OperationalError, UnicodeDecodeError):
+            # Базы нет: сервер отвечает ошибкой, которую psycopg2 на части
+            # установок не может декодировать. Пробуем создать базу.
+            pass
+        except Exception as e:
+            print('⚠️  Проверка базы не удалась:', self._error_text(e))
+
+        admin = dict(self.db_config, database='postgres')
+        conn = psycopg2.connect(**admin)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1 FROM pg_database WHERE datname = %s', (dbname,))
+                if cur.fetchone():
+                    return False
+                cur.execute(f'CREATE DATABASE "{dbname}"')
+                print(f"[+] База данных '{dbname}' создана")
+                return True
+        finally:
+            conn.close()
+
     @contextmanager
     def get_connection(self) -> Iterator['psycopg2.connection']:
         """Соединение с БД в виде контекст-менеджера."""
@@ -29,7 +80,7 @@ class DatabasePG:
         except Exception as e:
             if conn is not None:
                 conn.rollback()
-            print(f"❌ Ошибка работы с PostgreSQL: {e}")
+            print("❌ Ошибка работы с PostgreSQL:", self._error_text(e))
             raise
         finally:
             if conn is not None:
@@ -37,10 +88,9 @@ class DatabasePG:
 
     def init_db(self):
         """Инициализация базы данных - создание всех таблиц"""
+        self.ensure_database_exists()
         with self.get_connection() as conn:
             cursor = conn.cursor()
-
-            cursor.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
 
             # 1. Таблица ГРП
             cursor.execute('''
