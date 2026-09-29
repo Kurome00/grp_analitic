@@ -76,7 +76,6 @@ MENU_STRUCTURE = [
         ("⚠️ Предупреждения", "show_warnings", "grp"),
         ("🧮 Расчёт алгоритмов", "open_algorithms", "grp"),
         ("🔧 Технические коэффициенты", "view_tech", "grp"),
-        ("📊 Статистика", "view_stats", "grp"),
     ]),
     ("Справочники", [
         ("📦 Каталог оборудования", "view_catalog", "always"),
@@ -235,7 +234,6 @@ class GRPAppPG:
             ("grp", "🏗️  Рабочее ГРП", self.setup_grp_tab),
             ("catalog", "📦  Каталог оборудования", self.setup_catalog_tab),
             ("tech", "🔧  Технические коэффициенты", self.setup_tech_tab),
-            ("stats", "📊  Статистика", self.setup_stats_tab),
             ("repairs", "🛠️  Замены (ремонт)", self.setup_replacements_tab),
         ]
 
@@ -301,7 +299,9 @@ class GRPAppPG:
         """Переключение представления в основной области."""
         for _k, frame in self.tabs.items():
             frame.pack_forget()
-        self.tabs[key].pack(fill=tk.BOTH, expand=True)
+        frame = self.tabs.get(key)
+        if frame is not None:
+            frame.pack(fill=tk.BOTH, expand=True)
 
     # === Состояние выбранного ГРП ===
 
@@ -1692,11 +1692,17 @@ class GRPAppPG:
 
         n - количество оборудования с неисправностями | u - общее количество оборудования
         m - количество соединений с утечками | r - общее количество соединений
+
+        В диагностировании A выбирается из списка, n — отметкой неисправного
+        оборудования из списка ГРП, u считается автоматически,
+        m и r выбираются стрелками.
         """
 
         tk.Label(info_frame, text=formula_text, justify=tk.LEFT, font=("Arial", 9), fg="#495057").pack(fill=tk.X)
 
     def setup_stats_tab(self):
+        # Экран статистики убран из интерфейса (таб и пункт меню).
+        # Разметка и show_statistics() оставлены на случай возврата.
         select_frame = tk.Frame(self.stats_tab)
         select_frame.pack(pady=10)
 
@@ -1704,7 +1710,6 @@ class GRPAppPG:
         self.stats_grp_label = tk.Label(select_frame, text="—", font=("Arial", 10, "bold"), fg="#546E7A")
         self.stats_grp_label.pack(side=tk.LEFT, padx=8)
 
-        self._btn(select_frame, "📊 Показать статистику", self.show_statistics, color='primary', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
         self._btn(select_frame, "🔍 Проверить оборудование", self.check_equipment_stats, color='info', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
 
         self.stats_text = scrolledtext.ScrolledText(self.stats_tab, wrap=tk.WORD, height=20, font=("Courier", 10))
@@ -2045,9 +2050,19 @@ class GRPAppPG:
             return
         grp_id = grp[0]
 
+        # Оборудование в работе: из него выбираются неисправности (n)
+        # и автоматически берётся общее количество (u).
+        active = [e for e in self.db.get_equipment_by_grp(grp_id) if not e[3]]
+        u_count = len(active)
+        if not u_count:
+            messagebox.showinfo(
+                "Информация",
+                "У ГРП нет оборудования в эксплуатации — диагностирование не выполняется")
+            return
+
         window = Toplevel(self.root)
         window.title("Техническое диагностирование")
-        window.geometry("500x420")
+        window.geometry("620x700")
         window.transient(self.root)
         window.grab_set()
 
@@ -2055,40 +2070,104 @@ class GRPAppPG:
                  font=("Arial", 14, "bold"), fg="#546E7A").pack(pady=10)
 
         frame = tk.Frame(window)
-        frame.pack(pady=10)
+        frame.pack(pady=10, fill=tk.BOTH, expand=True)
 
-        tk.Label(frame, text="Коэффициент A (0 или 0.1):", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
-        a_entry = tk.Entry(frame, width=20)
-        a_entry.insert(0, "0")
-        a_entry.grid(row=0, column=1, pady=5)
+        # --- A: выбор из списка, ввод вручную не требуется
+        tk.Label(frame, text="Коэффициент A — узел редуцирования и фильтры:",
+                 font=("Arial", 10)).grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        A_CHOICES = ("0 — замечаний нет", "0.1 — есть замечания")
+        a_var = tk.StringVar(value=A_CHOICES[0])
+        a_box = ttk.Combobox(frame, textvariable=a_var, values=A_CHOICES,
+                             state="readonly", width=36)
+        a_box.grid(row=1, column=0, sticky=tk.W, pady=(2, 12))
 
-        tk.Label(frame, text="n - количество оборудования с неисправностями:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
-        n_entry = tk.Entry(frame, width=20)
-        n_entry.grid(row=1, column=1, pady=5)
+        def _a() -> float:
+            return float(a_var.get().split(" — ")[0])
 
-        tk.Label(frame, text="u - общее количество оборудования:", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
-        u_entry = tk.Entry(frame, width=20)
-        u_entry.grid(row=2, column=1, pady=5)
+        # --- n: отметка неисправного оборудования из списка
+        tk.Label(frame, text="n — отметьте оборудование с неисправностями "
+                             "(Ctrl для выбора нескольких):",
+                 font=("Arial", 10)).grid(row=2, column=0, columnspan=2, sticky=tk.W)
 
-        tk.Label(frame, text="m - количество соединений с утечками:", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
-        m_entry = tk.Entry(frame, width=20)
-        m_entry.grid(row=3, column=1, pady=5)
+        list_frame = tk.Frame(frame)
+        list_frame.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
+        eq_list = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, width=60, height=8,
+                             font=("Arial", 9), exportselection=False, bd=1, relief="solid")
+        eq_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=eq_list.yview)
+        eq_list.configure(yscrollcommand=eq_scroll.set)
+        eq_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        eq_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        for eq in active:
+            eq_list.insert(tk.END, str(eq[1]))
 
-        tk.Label(frame, text="r - общее количество соединений:", font=("Arial", 10)).grid(row=4, column=0, sticky=tk.W, pady=5)
-        r_entry = tk.Entry(frame, width=20)
-        r_entry.grid(row=4, column=1, pady=5)
+        marks = tk.Frame(frame)
+        marks.grid(row=4, column=0, columnspan=2, sticky=tk.W)
+        self._btn(marks, "Отметить все", lambda: eq_list.selection_set(0, tk.END),
+                  color='neutral', font_size=8, padx=8).pack(side=tk.LEFT, padx=(0, 6))
+        self._btn(marks, "Снять отметки", lambda: eq_list.selection_clear(0, tk.END),
+                  color='neutral', font_size=8, padx=8).pack(side=tk.LEFT)
+
+        # --- u: считается само, вручную не вводится
+        tk.Label(frame, text=f"u — всего оборудования в работе: {u_count}",
+                 font=("Arial", 10, "bold"), fg="#546E7A").grid(
+            row=5, column=0, columnspan=2, sticky=tk.W, pady=(12, 5))
+
+        # --- m и r: выбор стрелками
+        tk.Label(frame, text="m — разъёмных соединений с утечками:",
+                 font=("Arial", 10)).grid(row=6, column=0, sticky=tk.W, pady=4)
+        m_var = tk.StringVar(value="0")
+        ttk.Spinbox(frame, from_=0, to=999, textvariable=m_var,
+                    width=12).grid(row=6, column=1, sticky=tk.W, pady=4)
+
+        tk.Label(frame, text="r — всего разъёмных соединений:",
+                 font=("Arial", 10)).grid(row=7, column=0, sticky=tk.W, pady=4)
+        r_var = tk.StringVar(value=str(u_count))
+        ttk.Spinbox(frame, from_=0, to=999, textvariable=r_var,
+                    width=12).grid(row=7, column=1, sticky=tk.W, pady=4)
+
+        # --- живой пересчёт: выбор сразу виден в результате
+        preview = tk.Label(frame, text="", font=("Consolas", 10, "bold"),
+                           fg="#37474F", justify=tk.LEFT)
+        preview.grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(14, 0))
+
+        analyzer = self.tech_analyzer
+
+        def _ints(strict: bool = False):
+            try:
+                return int(m_var.get() or 0), int(r_var.get() or 0)
+            except ValueError:
+                if strict:
+                    raise ValueError("m и r должны быть целыми числами")
+                return 0, 0
+
+        def refresh(*_args):
+            m, r = _ints()
+            n = len(eq_list.curselection())
+            b = analyzer.calculate_coefficient_b(n, u_count)
+            c = analyzer.calculate_coefficient_c(m, r)
+            k = analyzer.calculate_coefficient_k(_a(), b, c)
+            rating, _rec = analyzer.get_technical_condition_rating(k)
+            preview.config(text=(
+                f"K = 1 - ({_a()} + {b:.4f} + {c:.4f}) = {k:.4f}\n"
+                f"n = {n}, u = {u_count}, m = {m}, r = {r}   →   {rating}"))
+
+        eq_list.bind('<<ListboxSelect>>', refresh)
+        a_box.bind('<<ComboboxSelected>>', refresh)
+        m_var.trace_add('write', refresh)
+        r_var.trace_add('write', refresh)
+        refresh()
 
         def calculate_and_save():
             try:
-                a = float(a_entry.get())
-                n = int(n_entry.get()) if n_entry.get() else 0
-                u = int(u_entry.get()) if u_entry.get() else 1
-                m = int(m_entry.get()) if m_entry.get() else 0
-                r = int(r_entry.get()) if r_entry.get() else 1
+                a = _a()
+                m, r = _ints(strict=True)
+                if r <= 0:
+                    raise ValueError("r должно быть больше нуля")
+                if m > r:
+                    raise ValueError(f"m ({m}) не может быть больше r ({r})")
+                n = len(eq_list.curselection())
 
-                analyzer = self.tech_analyzer
-
-                b = analyzer.calculate_coefficient_b(n, u)
+                b = analyzer.calculate_coefficient_b(n, u_count)
                 c = analyzer.calculate_coefficient_c(m, r)
                 k = analyzer.calculate_coefficient_k(a, b, c)
 
@@ -2098,7 +2177,7 @@ class GRPAppPG:
                     'c': c,
                     'k': k,
                     'n': n,
-                    'u': u,
+                    'u': u_count,
                     'm': m,
                     'r': r,
                     'diagnosis_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2118,20 +2197,22 @@ class GRPAppPG:
                 C = {c:.4f}
                 K = 1 - ({a} + {b:.4f} + {c:.4f}) = {k:.4f}
 
+                n = {n}, u = {u_count}, m = {m}, r = {r}
+
                 Оценка состояния: {rating}
                 Рекомендация: {rec}
                 """
 
-                messagebox.showinfo("Результаты", result_text)
+                messagebox.showinfo("Результаты", result_text, parent=window)
                 window.destroy()
                 self.load_tech_history()
                 self.statusbar.config(text=f"Техническая диагностика для ГРП #{grp_id} выполнена")
 
             except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
+                messagebox.showerror("Ошибка", str(e), parent=window)
 
         btn_frame = tk.Frame(window)
-        btn_frame.pack(pady=20)
+        btn_frame.pack(pady=16)
         self._btn(btn_frame, "🧮 Рассчитать и сохранить", calculate_and_save, color='indigo', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
 
