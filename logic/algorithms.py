@@ -6,7 +6,9 @@
     (приоритет наработки, двойной учёт K_сост, учёт некратных замен, T_диагн).
   * "docs/Алг3-схема данных.pdf"             — соответствие шагов разделам цифрового
     паспорта ГРП, сквозной пример ГРП №26.
-  * "docs/Алгоритм4.pdf"                    — Алгоритм 4 (Weighted Average).
+  * "docs/Алгоритм4.pdf"                    — Алгоритм 4. Из него используется только
+    календарная база (срок полной проверки); взвешивание с фактической наработкой
+    отключено, потому что данных телеметрии по элементам нет (см. calculate_algorithm_4).
   * "docs/Алгоритмы-(все до корректировки).pdf" — Алгоритмы 0-2 и сводные таблицы.
 
 Каждый шаг расчёта фиксируется в трассировке (steps), чтобы результат можно
@@ -113,6 +115,22 @@ def critical_title(key: str) -> str:
     return CRITICAL_ELEMENTS.get(key, (key, ()))[0]
 
 
+# Короткие названия для плотных таблиц: «ПЗК (предохранительно-запорный
+# клапан)» в графе шириной 150 px обрезается, хотя расшифровка всё равно видна
+# на вкладке «Методика» и в полном названии элемента.
+CRITICAL_SHORT = {
+    'regulator': 'Регулятор',
+    'pzk': 'ПЗК',
+    'psk': 'ПСК',
+    'filter': 'Фильтр',
+    'valve': 'Арматура',
+}
+
+
+def critical_short_title(key: str) -> str:
+    return CRITICAL_SHORT.get(key, critical_title(key))
+
+
 # ---------------------------------------------------------------------------
 # Структуры данных
 # ---------------------------------------------------------------------------
@@ -134,10 +152,6 @@ class AlgorithmParams:
     # Шаг 11: T_диагн = min(Z_ГРП · K_запаса; T_макс)
     reserve: float = 0.50
     max_diag_interval: float = 5.0
-    # Алгоритм 4: Z_база = α_wa·Z_календ + (1−α_wa)·Z_наработка
-    alpha_wa: float = 0.60
-    # Алгоритм 4: порог переработки календарного срока
-    t_crit: float = 5.0
 
     def as_rows(self) -> List[Tuple[str, str, str, str]]:
         """Строки (параметр, значение, диапазон, назначение) для вкладки исходных данных."""
@@ -154,10 +168,6 @@ class AlgorithmParams:
              'запас на непредсказуемость отказа процесса'),
             ('T_макс — макс. междиагностический интервал', num(self.max_diag_interval, 1), '5 лет',
              'Правила МЧС Республики Беларусь'),
-            ('α (Weighted Average)', num(self.alpha_wa, 2), '0,5…0,8',
-             'вес календарного срока в Z_база'),
-            ('T_крит — порог переработки', num(self.t_crit, 1), '3…10 лет',
-             'при Z_календ < −T_крит основа — календарный срок'),
         ]
 
 
@@ -309,12 +319,160 @@ class AlgorithmResult:
         }
 
 
+# ---------------------------------------------------------------------------
+# Сроки по методикам и слабые звенья
+# ---------------------------------------------------------------------------
+
+# Методики, по которым показываются сроки. Раньше выводился один сводный
+# («консервативный») срок — минимум по всем методикам; он смешивал разные
+# редакции и не позволял увидеть, где именно расхождение. Теперь показываются
+# два срока раздельно: по скорректированной методике (3) и по календарной (4).
+DEADLINE_ALGORITHMS: Tuple[int, ...] = (3, 4)
+
+# Слабым звеном считаем элементы, чей остаточный ресурс не превышает минимальный
+# более чем на это число лет: в пределах года разные элементы дают один и тот же
+# срок, и показывать надо их все, а не только первый попавшийся.
+WEAK_LINK_TOLERANCE = 0.5
+
+
+@dataclass
+class Deadline:
+    """Срок по одной методике: ресурс, дата диагностирования, слабые звенья."""
+    algorithm_number: int
+    algorithm_name: str
+    result: float
+    next_diagnosis: float
+    weak_element: Optional[str]
+    weak_links: List[Dict] = field(default_factory=list)
+    recommendation: str = ''
+    error: Optional[str] = None
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.error
+
+
+@dataclass
+class WeakLink:
+    """Слабое звено: элемент ГРП и определяющая его заменяемая деталь."""
+    element: str
+    category: str
+    z_element: float
+    part: Optional[str] = None
+    part_norm: Optional[float] = None
+    part_age: Optional[float] = None
+
+    def describe(self) -> str:
+        base = f'{self.element} — {years_to_text(self.z_element)}'
+        if self.part:
+            return f'{base} (деталь «{self.part}»'
+        return base
+
+    def as_dict(self) -> Dict:
+        return {
+            'element': self.element,
+            'category': self.category,
+            'z_element': self.z_element,
+            'part': self.part,
+            'part_norm': self.part_norm,
+            'part_age': self.part_age,
+        }
+
+
+def _driving_part(element: ElementResult) -> Optional[Dict]:
+    """Заменяемая деталь с наименьшим остатком — она определяет элемент."""
+    best, best_z = None, None
+    for detail in element.details or []:
+        z = _f(detail.get('z_base'))
+        if z is None:
+            z = (_f(detail.get('norm')) or 0.0) - (_f(detail.get('age')) or 0.0)
+        if best_z is None or z < best_z:
+            best, best_z = detail, z
+    return best
+
+
+def driving_part(element: ElementResult) -> Optional[Dict]:
+    """Публичная обёртка: деталь с наименьшим остатком определяет элемент."""
+    return _driving_part(element)
+
+
+def collect_weak_links(result: AlgorithmResult,
+                       tolerance: float = WEAK_LINK_TOLERANCE) -> List[WeakLink]:
+    """Слабые звенья результата — все элементы с минимальным ресурсом.
+
+    Возвращает список, а не одно имя: элементов-минимумов часто несколько
+    (например, у нескольких единиц одновременно истёк срок), и каждый из них
+    ограничивает ресурс ГРП.
+    """
+    used = result.used_elements if result else []
+    if not used:
+        return []
+    z_min = min(e.z_element for e in used)
+    limit = z_min + tolerance
+    links = []
+    for element in sorted(used, key=lambda e: (e.z_element, e.name)):
+        if element.z_element > limit:
+            break
+        part = _driving_part(element)
+        links.append(WeakLink(
+            element=element.name,
+            category=critical_title(element.critical_key) if element.critical_key else '—',
+            z_element=element.z_element,
+            part=part.get('name') if part else None,
+            part_norm=_f(part.get('norm')) if part else None,
+            part_age=_f(part.get('age')) if part else None,
+        ))
+    return links
+
+
+def build_deadlines(results: Dict[int, AlgorithmResult],
+                    numbers: Tuple[int, ...] = DEADLINE_ALGORITHMS
+                    ) -> List[Deadline]:
+    """Сроки по заданным методикам + слабые звенья каждого."""
+    deadlines = []
+    for number in numbers:
+        result = results.get(number)
+        if result is None:
+            deadlines.append(Deadline(
+                algorithm_number=number,
+                algorithm_name=ALGORITHM_TITLES.get(number, algo_label(number)),
+                result=0.0, next_diagnosis=0.0, weak_element=None,
+                error='методика не рассчитана'))
+            continue
+        deadlines.append(Deadline(
+            algorithm_number=number,
+            algorithm_name=result.algorithm_name,
+            result=result.result,
+            next_diagnosis=result.next_diagnosis,
+            weak_element=result.weak_element,
+            weak_links=collect_weak_links(result),
+            recommendation=result.recommendation,
+            error=result.error,
+        ))
+    return deadlines
+
+
+def algo_number(number: int) -> int:
+    """Номер методики в нумерации, которую видит пользователь: 0-4 → 1-5.
+
+    Внутри программы методики остаются с нуля: индексы нужны для обращения к
+    calculate_algorithm_N и ключам словарей результатов. Пересчитывать всю
+    нумерацию в коде незачем и опасно — достаточно сдвигать её на выходе.
+    """
+    return number + 1
+
+
+def algo_label(number: int) -> str:
+    """Подпись методики для интерфейса и отчётов: «Алгоритм 3»."""
+    return f'Алгоритм {number + 1}'
+
+
 ALGORITHM_TITLES = {
     0: 'Утверждённая методика',
     1: 'Среднее арифметическое',
     2: 'REGION-gaz (слабое звено)',
     3: 'Скорректированный (наработка + 4 коэффициента)',
-    4: 'Weighted Average (взвешенное среднее)',
+    4: 'Календарный (срок полной проверки)',
 }
 
 ALGORITHM_SHORT = {
@@ -322,7 +480,7 @@ ALGORITHM_SHORT = {
     1: 'Среднее арифметическое',
     2: 'REGION-gaz',
     3: 'Скорректированный',
-    4: 'Weighted Average',
+    4: 'Календарный',
 }
 
 
@@ -409,23 +567,45 @@ class GRPResourceCalculator:
         return FULL_CHECK_TERM, f'срок полной проверки ({FULL_CHECK_TERM:g} лет)'
 
     def _active_details(self, element: Dict) -> List[Dict]:
-        """Активные детали элемента (для базового ресурса)."""
+        """Активные ЗАМЕНЯЕМЫЕ детали элемента (для базового ресурса).
+
+        В расчёт идут только детали с признаком is_replaceable: именно они
+        имеют 5-летний срок службы и определяют остаточный ресурс.
+        Незаменяемые детали (крепёж, корпусные элементы, прокладки каталога и
+        т.п.) в сроке службы ГРП не участвуют.
+
+        Возраст заменяемой детали без собственной даты установки считается от
+        последней замены по элементу (replaced_on), а не от даты установки
+        оборудования: иначе деталь с нормой 5 лет, монтированная вместе с
+        ГРП 18 лет назад, получала остаток −13 лет, хотя её меняли при
+        ремонтах. Если замен в журнале нет, остаётся дата установки
+        оборудования — это честный просроченный срок службы.
+        """
         details = []
+        renewed_on = element.get('replaced_on')
         for item in element.get('details') or []:
             if not isinstance(item, dict):
                 continue
             if item.get('removal_date') or item.get('removed'):
                 continue
-            if item.get('is_replaceable') is False and _f(item.get('norm_years')) is None:
+            if not item.get('is_replaceable'):
                 continue
             norm = _f(item.get('norm_years'))
             if norm is None or norm <= 0:
                 continue
+            own_date = item.get('install_date')
+            if own_date:
+                source = 'дата установки детали'
+            elif renewed_on:
+                own_date, source = renewed_on, 'дата последней замены по журналу'
+            else:
+                source = 'дата установки оборудования'
             details.append({
                 'name': item.get('name') or 'Деталь',
                 'norm': norm,
-                'install_date': item.get('install_date'),
-                'age': self._age(item.get('install_date') or element.get('install_date')),
+                'install_date': own_date or element.get('install_date'),
+                'age': self._age(own_date or element.get('install_date')),
+                'install_source': source,
                 'consumed_ratio': _f(item.get('consumed_ratio')),
                 'norm_assumed': False,
             })
@@ -715,7 +895,7 @@ class GRPResourceCalculator:
                           full: bool = True) -> None:
         """Z_эл = Z_база × K_сост × K_эксл × K_рем × k_повр.
 
-        full=False — только базовый ресурс и K_сост (Алгоритм 1, где
+        full=False — только базовый ресурс и K_сост (Алгоритм 2, где
         остальные поправки не применяются по методике).
         """
         z_base = element.z_base if element.z_base is not None else 0.0
@@ -729,13 +909,15 @@ class GRPResourceCalculator:
             product *= value
         raw = z_base * product
         element.z_element = max(0.0, raw)
+        # Формула идёт числом (чтобы сходилась с методикой), а следом —
+        # человекочитаемый срок: «5,000 × … = 0,000 (0 дн)», а не «= 0,000 лет».
         element.z_element_formula = (
             f'{num(z_base, 3)} × ' +
             ' × '.join(f'{num(value, 3)}' for _, value in factors) +
-            f' = {num(element.z_element, 3)}'
+            f' = {num(element.z_element, 3)} ({years_to_text(element.z_element)})'
         )
-        element.z_element_note = ('полный набор поправок (Алгоритм 3/4)'
-                                  if full else 'только K_сост (Алгоритм 1)')
+        element.z_element_note = ('полный набор поправок (Алгоритм 4/5)'
+                                  if full else 'только K_сост (Алгоритм 2)')
         if raw < 0:
             element.z_element_note += '; отрицательный ресурс ограничен нулем'
 
@@ -753,6 +935,12 @@ class GRPResourceCalculator:
             if critical_only and not element.critical_key:
                 element.used = False
                 element.skip_reason = 'не является критическим элементом'
+            elif not element.details:
+                # Расчёт ведётся только по заменяемым деталям. Если у элемента
+                # таких нет, включение его в расчёт дало бы ложные 20 лет
+                # по сроку полной проверки — исключаем и объясняем причину.
+                element.used = False
+                element.skip_reason = 'нет заменяемых деталей'
             elif element.removed:
                 # Оборудование снято с эксплуатации: его ресурс уже выработан,
                 # в текущую оценку оно не входит. Полная замена оборудования
@@ -786,19 +974,16 @@ class GRPResourceCalculator:
         if element.critical_key:
             label += f'   [критический: {critical_title(element.critical_key)}]'
         result.steps.append(Step('title', f'ЭЛЕМЕНТ {index}: {label}'))
-        result.steps.append(Step('note', f'S_нач = {num(element.norm, 2)} лет '
+        result.steps.append(Step('note', f'S_нач = {years_to_text(element.norm)} '
                                          f'({element.norm_source}); возраст = '
-                                         f'{num(element.age, 2)} лет'
+                                         f'{years_to_text(element.age)}'
                                          + (f'; демонтирован {element.removal_date or ""}'
                                             if element.removed else '')))
         if not element.used and element.skip_reason:
             result.steps.append(Step('warn', f'⚠ {element.skip_reason} — в расчёт не входит'))
 
     def _step_base(self, result: AlgorithmResult, element: ElementResult,
-                   z_calendar: Optional[float] = None,
-                   z_workload: Optional[float] = None,
-                   alpha: Optional[float] = None,
-                   t_crit: Optional[float] = None) -> None:
+                   z_calendar: Optional[float] = None) -> None:
         """Шаг 2: базовый ресурс (в т.ч. вариант Алгоритма 4)."""
         result.steps.append(Step('formula', '  Шаг 2. Базовый ресурс Z_база'))
         norm = element.norm or 0.0
@@ -806,28 +991,13 @@ class GRPResourceCalculator:
         if z_calendar is not None:
             result.steps.append(Step('value',
                                      f'    Z_календ = S_нач − S_факт = {num(norm, 2)}'
-                                     f' − {num(element.age, 2)} = {num(z_calendar, 2)} лет'))
-            if z_workload is not None:
-                source = element.z_workload_source or 'телеметрия'
-                result.steps.append(Step('value',
-                                         f'    Z_наработка = {num(z_workload, 2)} лет'
-                                         f' ({source})'))
-            if alpha is not None:
-                if z_calendar < -t_crit:
-                    result.steps.append(Step('value',
-                                             f'    Ограничение: Z_календ = {num(z_calendar, 2)}'
-                                             f' < −T_крит = −{num(t_crit, 1)} → основа '
-                                             f'Z_календ (ресурс уже отрицателен)'))
-                    result.steps.append(Step('value',
-                                             f'    Z_база = {num(z_calendar, 2)} лет'))
-                else:
-                    z_base = alpha * z_calendar + (1 - alpha) * z_workload
-                    result.steps.append(Step('value',
-                                             f'    Z_база = α·Z_календ + (1−α)·Z_наработка'))
-                    result.steps.append(Step('value',
-                                             f'      = {num(alpha, 2)}×{num(z_calendar, 2)}'
-                                             f' + {num(1 - alpha, 2)}×{num(z_workload, 2)}'
-                                             f' = {num(z_base, 2)} лет'))
+                                     f' − {num(element.age, 2)} = {years_to_text(z_calendar)}'))
+            result.steps.append(Step('note',
+                                     '    Основа — календарный срок полной проверки. '
+                                     'Взвешивание с фактической наработкой не применяется: '
+                                     'телеметрии по элементам нет.'))
+            result.steps.append(Step('value',
+                                     f'    Z_база = Z_календ = {years_to_text(z_calendar)}'))
             return
 
         result.steps.append(Step('note', f'    Вариант {element.z_base_variant}: '
@@ -837,8 +1007,9 @@ class GRPResourceCalculator:
                 continue
             result.steps.append(Step('value',
                                      f'      деталь «{detail["name"]}»: S_нач = '
-                                     f'{num(detail["norm"], 2)}, возраст = '
-                                     f'{num(detail["age"], 2)} → Z = {num(detail["z_base"], 2)}'))
+                                     f'{years_to_text(detail["norm"])}, возраст = '
+                                     f'{years_to_text(detail["age"])} → '
+                                     f'Z = {years_to_text(detail["z_base"])}'))
         result.steps.append(Step('formula',
                                  f'    Z_база = {element.z_base_formula}'))
 
@@ -872,7 +1043,7 @@ class GRPResourceCalculator:
     def _step_element_total(self, result: AlgorithmResult, element: ElementResult) -> None:
         result.steps.append(Step('formula', '  Шаг 8. Ресурс элемента '
                                             'Z_эл = Z_база × K_сост × K_эксл × K_рем × k_повр'))
-        result.steps.append(Step('value', f'    {element.z_element_formula} лет'))
+        result.steps.append(Step('value', f'    {element.z_element_formula}'))
         if element.z_element <= 0 and (element.z_base or 0) > 0:
             result.steps.append(Step('warn', '    ⚠ ресурс исчерпан: элемент требует замены'))
 
@@ -941,11 +1112,12 @@ class GRPResourceCalculator:
             if not element.used:
                 continue
             element.z_element = max(0.0, element.z_base or 0.0)
-            element.z_element_formula = num(element.z_base, 2)
+            element.z_element_formula = (f'{num(element.z_base, 2)} '
+                                         f'({years_to_text(element.z_base)})')
             element.z_element_note = 'утверждённая методика: ресурс без поправок'
             result.steps.append(Step('value',
                                      f'    Z_элемент = {num(element.norm, 2)}'
-                                     f' − {num(element.age, 2)} = {num(element.z_base, 2)} лет'))
+                                     f' − {num(element.age, 2)} = {years_to_text(element.z_base)}'))
 
         resources = [e.z_base if e.z_base is not None else 0.0 for e in used]
         m = len(used)
@@ -962,7 +1134,7 @@ class GRPResourceCalculator:
         result.steps.append(Step('value', f'  m = {m}'))
         result.steps.append(Step('value', f'  Σ Z_элемент = {num(total, 3)}'))
         result.steps.append(Step('value', f'  Z_ГРП = Σ Z / m = {num(total, 3)} / {m}'
-                                          f' = {num(avg, 3)} лет'))
+                                          f' = {num(avg, 3)} ({years_to_text(avg)})'))
         result.recommendation = self._recommendation(result.result,
                                                      self._weak_of(used), result.next_diagnosis)
         return result
@@ -1029,11 +1201,11 @@ class GRPResourceCalculator:
                                      f'  K_общ = 1 − ({num(a, 2)} + {num(b, 4)}'
                                      f' + {num(c, 4)}) = {num(k_common, 4)}  ({source})'))
         result.steps.append(Step('value', f'  Z_ГРП = {num(avg, 3)} × {num(k_common, 4)}'
-                                          f' = {num(z_grp, 3)} лет'))
+                                          f' = {num(z_grp, 3)} ({years_to_text(z_grp)})'))
         result.steps.append(Step('value', f'  T_диагн = min({num(z_grp, 3)} × '
                                           f'{num(self.params.reserve, 2)}; '
                                           f'{num(self.params.max_diag_interval, 0)})'
-                                          f' = {num(result.next_diagnosis, 3)} лет'))
+                                          f' = {years_to_text(result.next_diagnosis)}'))
         result.recommendation = self._recommendation(result.result,
                                                      self._weak_of(used), result.next_diagnosis)
         return result
@@ -1072,12 +1244,11 @@ class GRPResourceCalculator:
                             for e in used if e.critical_key)
         result.steps.append(Step('value', f'  {listing}'))
         result.steps.append(Step('value', f'  Слабое звено: {result.weak_element}'
-                                          f' → Z_ГРП = {num(result.result, 3)} лет'))
+                                          f' → Z_ГРП = {years_to_text(result.result)}'))
         result.steps.append(Step('value', f'  T_диагн = min({num(result.result, 3)} × '
                                           f'{num(self.params.reserve, 2)}; '
                                           f'{num(self.params.max_diag_interval, 0)})'
-                                          f' = {num(result.next_diagnosis, 3)} лет'
-                                          f' ≈ {years_to_text(result.next_diagnosis)}'))
+                                          f' = {years_to_text(result.next_diagnosis)}'))
         result.recommendation = self._recommendation(result.result,
                                                      self._weak_of(used), result.next_diagnosis)
         return result
@@ -1123,14 +1294,13 @@ class GRPResourceCalculator:
         result.steps.append(Step('value', f'  {listing}'))
         result.steps.append(Step('value', f'  Слабое звено: {result.weak_element}'))
         result.steps.append(Step('formula', '  Шаг 10. Z_ГРП = Z_слабое'))
-        result.steps.append(Step('value', f'  Z_ГРП = {num(result.result, 3)} лет'))
+        result.steps.append(Step('value', f'  Z_ГРП = {years_to_text(result.result)}'))
         result.steps.append(Step('formula', '  Шаг 11. T_диагн = min(Z_ГРП × K_запаса; '
                                             'T_макс)'))
         result.steps.append(Step('value', f'  T_диагн = min({num(result.result, 3)} × '
                                           f'{num(self.params.reserve, 2)}; '
                                           f'{num(self.params.max_diag_interval, 0)})'
-                                          f' = {num(result.next_diagnosis, 3)} лет'
-                                          f' ≈ {years_to_text(result.next_diagnosis)}'))
+                                          f' = {years_to_text(result.next_diagnosis)}'))
         result.steps.append(Step('note', '  Шаг 12. Верификация — сравнить с протоколом '
                                          'испытаний и при расхождении > 20% пересчитать '
                                          'α, β, δ, θ по истории 5-10 объектов.'))
@@ -1141,14 +1311,36 @@ class GRPResourceCalculator:
     # -- Алгоритм 4 ---------------------------------------------------------
 
     def calculate_algorithm_4(self, equipment_data: List[Dict]) -> AlgorithmResult:
-        """Алгоритм 4 — Weighted Average: Z_база = α·Z_календ + (1−α)·Z_наработка
-        с защитой от абсурдных решений при Z_календ < −T_крит."""
+        """Алгоритм 4 — календарный ресурс по сроку полной проверки.
+
+        Отличается от скорректированной методики (Алгоритм 3) только базой:
+        Z_база = Z_календ = S_нач − S_факт, где S_нач — срок полной проверки
+        оборудования, а S_факт — его возраст. Дальше применяются те же
+        коэффициенты K_сост, K_эксл, K_рем, k_повр и то же правило слабого звена.
+
+        Взвешивание с фактической наработкой (Z_база = α·Z_календ +
+        (1−α)·Z_наработка) из методики не применяется. Телеметрии по элементам
+        в базе нет, а без неё Z_наработка подставляется равной Z_календ, и
+        смешивание математически сокращалось до того же календарного срока —
+        то есть α не влиял ни на что. Поэтому член Z_наработка и вес α убраны,
+        а вместе с ними и порог переработки T_крит: он защищал именно то
+        смешивание, которого больше нет.
+
+        Внимание к шкале: Z_календ живёт в масштабе 20 лет и отвечает на
+        вопрос «сколько прослужит оборудование», тогда как Алгоритм 3 считает
+        по 5-летним заменяемым деталям и отвечает «когда истечёт расходник».
+        Это разные величины, поэтому расхождение между методиками ожидаемо.
+        """
         params = self.params
         result = AlgorithmResult(ALGORITHM_TITLES[4], 4, 0.0)
         self._header(result)
         result.steps.append(Step('note', 'Шаги 6-14 совпадают со скорректированным '
                                          'Алгоритмом 3: K_сост, K_эксл, K_рем, k_повр, '
                                          'учёт некратных замен и принцип слабого звена.'))
+        result.steps.append(Step('note', 'База отличается: Z_база = Z_календ = '
+                                         'S_нач − S_факт (срок полной проверки минус '
+                                         'возраст оборудования). Взвешивание с фактической '
+                                         'наработкой отключено — телеметрии нет.'))
         prepared, used = self._prepare(equipment_data, critical_only=True)
 
         if not used:
@@ -1158,27 +1350,18 @@ class GRPResourceCalculator:
             self._element_header(result, i, element)
             if not element.used:
                 continue
+            norm = element.norm or 0.0
             z_calendar = (element.z_calendar if element.z_calendar is not None
-                          else (element.norm or 0.0) - element.age)
-            z_workload = (element.z_workload if element.z_workload is not None
-                          else z_calendar)
+                          else norm - element.age)
             element.z_calendar = z_calendar
-            element.z_workload = z_workload
-            if not element.z_workload_source:
-                element.z_workload_source = ('телеметрия отсутствует → Z_наработка = Z_календ'
-                                             if z_workload == z_calendar else 'расчёт по наработке')
-
-            if z_calendar < -params.t_crit:
-                z_base = z_calendar
-            else:
-                z_base = params.alpha_wa * z_calendar + (1 - params.alpha_wa) * z_workload
-            element.z_base = z_base
-            element.z_base_variant = 'WA'
+            element.z_base = z_calendar
+            element.z_base_variant = 'В'
+            element.z_base_formula = f'{num(norm, 2)} − {num(element.age, 2)}'
+            element.z_base_note = ('календарный ресурс по сроку полной проверки; '
+                                   'фактическая наработка не учитывается')
             self._finalize_element(element)
 
-            self._step_base(result, element, z_calendar=z_calendar,
-                            z_workload=z_workload, alpha=params.alpha_wa,
-                            t_crit=params.t_crit)
+            self._step_base(result, element, z_calendar=z_calendar)
             self._step_coefficients(result, element)
             self._step_element_total(result, element)
 
@@ -1189,20 +1372,18 @@ class GRPResourceCalculator:
         result.result = max(0.0, min(e.z_element for e in used))
         result.next_diagnosis = min(result.result * params.reserve, params.max_diag_interval)
         result.scalars = {'Z_weak': result.result, 'K_common_tech': None,
-                          'T_next_diagnosis': result.next_diagnosis,
-                          'alpha': params.alpha_wa, 't_crit': params.t_crit}
+                          'T_next_diagnosis': result.next_diagnosis}
 
         result.steps.append(Step('title', 'ИТОГ'))
         listing = '; '.join(f'{critical_title(e.critical_key)} = {num(e.z_element, 2)}'
                             for e in used if e.critical_key)
         result.steps.append(Step('value', f'  {listing}'))
         result.steps.append(Step('value', f'  Слабое звено: {result.weak_element}'))
-        result.steps.append(Step('value', f'  Z_ГРП = {num(result.result, 3)} лет'))
+        result.steps.append(Step('value', f'  Z_ГРП = {years_to_text(result.result)}'))
         result.steps.append(Step('value', f'  T_диагн = min({num(result.result, 3)} × '
                                           f'{num(params.reserve, 2)}; '
                                           f'{num(params.max_diag_interval, 0)})'
-                                          f' = {num(result.next_diagnosis, 3)} лет'
-                                          f' ≈ {years_to_text(result.next_diagnosis)}'))
+                                          f' = {years_to_text(result.next_diagnosis)}'))
         result.recommendation = self._recommendation(result.result, weak,
                                                      result.next_diagnosis)
         return result

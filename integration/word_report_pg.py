@@ -21,15 +21,18 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
-from core.config import FULL_CHECK_TERM
+from core.config import FULL_CHECK_TERM, REPLACEABLE_NORM_YEARS
 from core.models import Equipment
 from core.timefmt import years_to_text
 from logic.algorithms import (
     DAMAGE_MARKERS,
+    DEADLINE_ALGORITHMS,
     FAILURE_MARKERS,
     POOR_REPAIR_MARKERS,
     AlgorithmParams,
     GRPResourceCalculator,
+    algo_label,
+    build_deadlines,
     calculate_all_algorithms,
     critical_title,
     num,
@@ -478,8 +481,8 @@ def _norm_cell(element):
     источника, чтобы принятое значение нельзя было спутать с нормативным.
     """
     if element.norm:
-        return _fmt(element.norm, 1)
-    return f'{_fmt(FULL_INSPECTION_TERM, 0)}*'
+        return years_to_text(element.norm)
+    return f'{years_to_text(FULL_INSPECTION_TERM)}*'
 
 
 def _term_source_note(element):
@@ -487,9 +490,20 @@ def _term_source_note(element):
     if element is not None and element.norm:
         return ''
     return (f'* — нормативный срок в базе отсутствует; принят срок полной '
-            f'проверки оборудования — {_fmt(FULL_INSPECTION_TERM, 0)} лет. '
+            f'проверки оборудования — {years_to_text(FULL_INSPECTION_TERM)}. '
             f'По истечении этого срока эксплуатация не подтверждается и '
             f'требуется полная проверка.')
+
+
+def _effect_text(effect, equipment_name='', part_name=''):
+    """Влияние записи журнала на срок службы — текстом."""
+    if effect == 'part':
+        where = ' → '.join(x for x in (equipment_name, part_name) if x)
+        return f'срок заново: {where}' if where else 'срок детали заново'
+    if effect == 'equipment':
+        return (f'срок заново: {equipment_name} (целиком)'
+                if equipment_name else 'срок оборудования заново')
+    return '—'
 
 
 def _age_years(value):
@@ -600,7 +614,12 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
     analysis = doc_analyzer.analyze_grp_equipment(equipment_list)
     current = analysis['current']
     stats = current['statistics']
-    replacements = db.get_replacements_by_grp(grp_id) or []
+    # Подробная выборка нужна для графы «Влияние на срок»; при её отсутствии
+    # отчёт собирается из обычного журнала и показывает «—».
+    try:
+        replacements = db.get_replacements_detailed(grp_id) or []
+    except AttributeError:
+        replacements = db.get_replacements_by_grp(grp_id) or []
 
     journal = _load_journal(db, grp_id)
     coefficients = _coefficients(db, grp_id)
@@ -609,6 +628,8 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
                                        params=params, coefficients=coefficients)
     primary = results[3]
     usable = [r for r in results.values() if not r.error]
+    # Два срока — по методикам 3 и 4 — плюс слабые звенья каждого.
+    deadlines = build_deadlines(results)
 
     doc = Document()
     _setup_styles(doc)
@@ -641,8 +662,8 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
     _build_table(doc, ['Показатель', 'Значение'], [
         ['Тип газорегуляторного пункта', grp[1]],
         ['Количество ниток', _fmt(grp[2], 0)],
-        ['Фактический срок службы, лет', _fmt(grp[3], 1)],
-        ['Проектный срок службы, лет', _fmt(grp[4], 1)],
+        ['Фактический срок службы', years_to_text(grp[3])],
+        ['Проектный срок службы', years_to_text(grp[4])],
         ['Оборудования в эксплуатации, ед.', _fmt(stats['total'], 0)],
         ['Замен запчастей по журналу, ед.', _fmt(len(replacements), 0)],
     ], widths=[8.0, 7.5], aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER],
@@ -698,31 +719,55 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
     # --- 3. Результаты расчёта --------------------------------------------
     _section_title(doc, '3 РЕЗУЛЬТАТЫ РАСЧЁТА ОСТАТОЧНОГО РЕСУРСА')
     if usable:
-        _body(doc, f'Остаточный ресурс ГРП «{grp_name}» по основной методике '
-                   f'(алгоритм 3) составляет {years_to_text(primary.result)} '
-                   f'({_fmt(primary.result, 2)} года). Слабым звеном определён '
-                   f'элемент «{primary.weak_element}».', bold=True, space_after=8)
+        _body(doc, 'Остаточный ресурс ГРП «' + grp_name + '» определён раздельно '
+                   'по двум методикам. Оба срока приведены независимо, '
+                   'сведение в одну величину не выполняется.', space_after=6)
+        deadline_rows, deadline_fills = [], []
+        for dl in deadlines:
+            if dl.error:
+                deadline_rows.append([f'{algo_label(dl.algorithm_number)} — {dl.algorithm_name}',
+                                      '—', '—', dl.error])
+                deadline_fills.append(FILL_TOTAL)
+                continue
+            deadline_rows.append([
+                f'{algo_label(dl.algorithm_number)} — {dl.algorithm_name}',
+                years_to_text(dl.result),
+                years_to_text(dl.next_diagnosis),
+                f'{len(dl.weak_links)}',
+            ])
+            deadline_fills.append(FILL_TOTAL if dl.result <= 0 else None)
+        _build_table(doc, ['Методика', 'Остаточный ресурс', 'Срок диагностирования',
+                           'Слабых звеньев'],
+                     deadline_rows, widths=[6.4, 3.4, 3.4, 2.3],
+                     aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
+                             WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER],
+                     row_fills=deadline_fills, size=10)
+        _body(doc, '', indent=False, space_after=6)
+        _note(doc, 'Срок диагностирования T_диагн = min(Z_ГРП × K_запаса; T_макс). '
+                   'Расчёт выполнен по заменяемым деталям (расходным), имеющим '
+                   f'срок службы {REPLACEABLE_NORM_YEARS:g} лет.')
+        _body(doc, '', indent=False, space_after=6)
     else:
         _body(doc, 'Расчёт остаточного ресурса не выполнен: '
                    f'{primary.error or "нет исходных данных"}.', bold=True,
-              color=RED, space_after=8)
+               color=RED, space_after=8)
 
     caption('Сравнение результатов по методикам')
     comparison_rows, fills = [], []
     for number, result in sorted(results.items()):
         if result.error:
-            comparison_rows.append([f'Алгоритм {number} — {result.algorithm_name}',
+            comparison_rows.append([f'{algo_label(number)} — {result.algorithm_name}',
                                     '—', '—', result.error])
             fills.append(FILL_TOTAL)
             continue
         comparison_rows.append([
-            f'Алгоритм {number} — {result.algorithm_name}'
-            + (' (основная)' if number == 3 else ''),
+            f'{algo_label(number)} — {result.algorithm_name}'
+            + (' (основной)' if number in DEADLINE_ALGORITHMS else ''),
             years_to_text(result.result),
             years_to_text(result.next_diagnosis),
             result.weak_element or '—',
         ])
-        fills.append(FILL_TOTAL if number == 3 else None)
+        fills.append(FILL_TOTAL if number in DEADLINE_ALGORITHMS else None)
     _build_table(doc, ['Методика', 'Остаточный ресурс', 'Срок диагностирования',
                        'Слабое звено'],
                  comparison_rows, widths=[5.6, 3.2, 3.2, 3.5],
@@ -732,10 +777,45 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
     _body(doc, '', indent=False, space_after=6)
 
     if usable:
-        worst = min(usable, key=lambda r: r.result)
-        _body(doc, f'Справочно: консервативная оценка (минимум по всем методикам) — '
-                   f'{years_to_text(worst.result)}, методика «{worst.algorithm_name}». '
-                   f'Рекомендация: {worst.recommendation}', size=12, space_after=8)
+        _body(doc, '', indent=False, space_after=6)
+        _section_title(doc, '3.1 СЛАБЫЕ ЗВЕНЬЯ')
+        _body(doc, 'Слабое звено — элемент с наименьшим остаточным ресурсом; именно '
+                   'он ограничивает ресурс ГРП. Ниже перечислены все элементы, '
+                   'чьи ресурсы совпадают с минимумом (в пределах полугода), '
+                   'с указанием заменяемой детали, определившей их состояние.',
+               space_after=8)
+        for dl in deadlines:
+            if dl.error:
+                continue
+            heading = (f'{algo_label(dl.algorithm_number)} — {dl.algorithm_name}: '
+                       f'слабых звеньев — {len(dl.weak_links)}')
+            _body(doc, heading, bold=True, space_after=4)
+            if not dl.weak_links:
+                _body(doc, 'Слабые звенья не определены: в расчёт не вошёл ни один '
+                           'критический элемент с заменяемыми деталями.', size=12,
+                       space_after=8)
+                continue
+            weak_rows = []
+            for link in dl.weak_links:
+                weak_rows.append([
+                    link.element,
+                    link.category,
+                    years_to_text(link.z_element),
+                    link.part or '—',
+                    years_to_text(link.part_norm) if link.part_norm else '—',
+                    years_to_text(link.part_age) if link.part_age is not None else '—',
+                ])
+            _build_table(doc, ['Элемент ГРП', 'Категория', 'Ресурс элемента',
+                               'Определяющая деталь', 'S нач детали', 'Возраст детали'],
+                         weak_rows, widths=[4.2, 2.8, 2.2, 3.4, 1.8, 1.8],
+                         aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
+                                 WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT,
+                                 WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER],
+                         size=9)
+            _body(doc, '', indent=False, space_after=6)
+            if dl.recommendation:
+                _body(doc, f'Рекомендация по методике {dl.algorithm_number}: '
+                           f'{dl.recommendation}', size=12, space_after=8)
 
     # --- 4. Поэлементный расчёт -------------------------------------------
     _section_title(doc, '4 ПОЭЛЕМЕНТНЫЙ РАСЧЁТ')
@@ -755,8 +835,8 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
                 element.name,
                 'не входит в расчёт: ' + element.skip_reason,
                 _norm_cell(element),
-                _fmt(element.age, 1),
-                f'{_fmt(element.z_base, 2)} ({element.z_base_variant or "—"})',
+                years_to_text(element.age),
+                f'{years_to_text(element.z_base)} ({element.z_base_variant or "—"})',
                 '—', '—', '—', '—', '—'])
             element_fills.append(FILL_BAND)
             continue
@@ -764,22 +844,22 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
             element.name,
             critical_title(element.critical_key) if element.critical_key else '—',
             _norm_cell(element),
-            _fmt(element.age, 1),
-            f'{_fmt(element.z_base, 2)} ({element.z_base_variant or "—"})',
+            years_to_text(element.age),
+            f'{years_to_text(element.z_base)} ({element.z_base_variant or "—"})',
             _fmt(element.k_state, 3),
             _fmt(element.k_cond, 3),
             _fmt(element.k_repair, 3),
             _fmt(element.k_fail, 3),
-            _fmt(element.z_element, 2),
+            years_to_text(element.z_element),
         ])
         element_fills.append(FILL_RED if element.name == weak_name
                              else (FILL_AMBER if element.z_element <= 0 else None))
     if primary.elements:
-        _build_table(doc, ['Элемент', 'Категория', 'S нач, лет', 'Возраст, лет',
-                           'Z база, лет', 'K сост', 'K эксл', 'K рем', 'k повр',
-                           'Z эл, лет'],
+        _build_table(doc, ['Элемент', 'Категория', 'S нач', 'Возраст',
+                           'Z база', 'K сост', 'K эксл', 'K рем', 'k повр',
+                           'Z эл'],
                      element_rows,
-                     widths=[3.6, 2.6, 1.3, 1.3, 1.9, 1.1, 1.1, 1.1, 1.1, 1.4],
+                     widths=[3.4, 2.4, 1.5, 1.6, 2.0, 1.1, 1.1, 1.1, 1.1, 1.4],
                      row_fills=element_fills, size=8)
         _note(doc, 'Выделенная строка — слабое звено, определяющее итог по ГРП. '
                    'Здесь и далее: Zбаза — базовый ресурс в варианте оценки '
@@ -799,7 +879,7 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
         _note(doc, f'Расчёт остаточного ресурса не выполнен: {primary.error}. '
                    f'Для контроля срока эксплуатации по перечисленным позициям '
                    f'принят срок полной проверки оборудования — '
-                   f'{_fmt(FULL_INSPECTION_TERM, 0)} лет.', color=AMBER)
+                   f'{years_to_text(FULL_INSPECTION_TERM)}.', color=AMBER)
         fallback_rows, fallback_fills = [], []
         for row in equipment_rows:
             row = list(row) + [None] * 4
@@ -807,16 +887,16 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
                 continue
             fallback_rows.append([
                 row[1] or 'Без названия', row[2] or '—',
-                f'{_fmt(FULL_INSPECTION_TERM, 0)}*',
-                _fmt(_age_years(row[2]), 1), '—', '—', '—', '—', '—', '—'])
+                f'{years_to_text(FULL_INSPECTION_TERM)}*',
+                years_to_text(_age_years(row[2])), '—', '—', '—', '—', '—', '—'])
             fallback_fills.append(FILL_AMBER)
         if fallback_rows:
             caption('Принятые сроки службы при отсутствии нормативов')
-            _build_table(doc, ['Элемент', 'Дата установки', 'S нач, лет',
-                               'Возраст, лет', 'Z база, лет', 'K сост',
-                               'K эксл', 'K рем', 'k повр', 'Z эл, лет'],
+            _build_table(doc, ['Элемент', 'Дата установки', 'S нач',
+                               'Возраст', 'Z база', 'K сост',
+                               'K эксл', 'K рем', 'k повр', 'Z эл'],
                          fallback_rows,
-                         widths=[3.6, 2.2, 1.3, 1.3, 1.9, 1.1, 1.1, 1.1, 1.1, 1.4],
+                         widths=[3.4, 2.2, 1.5, 1.6, 2.0, 1.1, 1.1, 1.1, 1.1, 1.4],
                          row_fills=fallback_fills, size=8)
             _note(doc, _term_source_note(None), color=AMBER)
     _body(doc, '', indent=False, space_after=6)
@@ -906,7 +986,7 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
         _build_table(doc, ['Оборудование', 'Дата установки',
                            'Принятый срок', 'Мероприятие'],
                      [[item['name'], item['install_date'] or '—',
-                       _fmt(FULL_INSPECTION_TERM, 0),
+                       years_to_text(FULL_INSPECTION_TERM),
                        'Внести состав запчастей и нормы']
                       for item in current['no_norm']],
                      widths=[5.2, 2.4, 2.4, 5.5],
@@ -917,7 +997,7 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
         _body(doc, '', indent=False, space_after=6)
         _body(doc, f'Нормативные сроки по указанным позициям в базе отсутствуют, '
                    f'поэтому для контроля принят срок полной проверки оборудования '
-                   f'— {_fmt(FULL_INSPECTION_TERM, 0)} лет. По истечении этого срока '
+                   f'— {years_to_text(FULL_INSPECTION_TERM)}. По истечении этого срока '
                    f'эксплуатация не подтверждается. Детальный расчёт остаточного '
                    f'ресурса выполняется после внесения состава запчастей и норм.',
               space_after=6)
@@ -964,19 +1044,33 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
 
     if replacements:
         caption('Журнал замен запчастей')
+        # Подробная выборка, если она доступна: добавляет графу о влиянии
+        # записи на срок службы (сброс срока детали или оборудования).
+        detailed = None
+        try:
+            detailed = replacements
+            rows = [[str(index), record[1] or '—', record[2] or '—',
+                     record[3] or '—', record[4] or '—', record[5] or '—',
+                     record[6] or '—', record[7] or '—', record[8] or '—',
+                     _effect_text(record[11], record[13], record[14])]
+                    for index, record in enumerate(detailed, start=1)]
+        except (IndexError, TypeError):
+            rows = [[str(index), record[1] or '—', record[2] or '—',
+                     record[3] or '—', record[4] or '—', record[5] or '—',
+                     record[6] or '—', record[7] or '—', record[8] or '—', '—']
+                    for index, record in enumerate(replacements, start=1)]
         _build_table(doc,
                      ['№', 'Дата', 'Номер запчасти', 'Тип оборудования', 'Модель',
-                      'Производитель', 'Вид работ', 'Причина', 'Ответственный'],
-                     [[str(index), record[1] or '—', record[2] or '—',
-                       record[3] or '—', record[4] or '—', record[5] or '—',
-                       record[6] or '—', record[7] or '—', record[8] or '—']
-                      for index, record in enumerate(replacements, start=1)],
-                     widths=[0.9, 2.0, 2.6, 3.6, 2.4, 2.8, 2.6, 4.6, 3.5],
+                      'Производитель', 'Вид работ', 'Причина', 'Ответственный',
+                      'Влияние на срок'],
+                     rows,
+                     widths=[0.8, 1.9, 2.4, 3.0, 2.1, 2.4, 2.3, 3.8, 2.8, 3.5],
                      aligns=[WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER,
                              WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
                              WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
                              WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
-                             WD_ALIGN_PARAGRAPH.LEFT], size=9)
+                             WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+                     size=9)
 
     # Возврат в книжную ориентацию
     portrait = doc.add_section(WD_SECTION.NEW_PAGE)
@@ -1004,7 +1098,7 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
         conclusions.append(
             (INK, f'Плановый срок диагностирования по основной методике — '
                   f'{years_to_text(primary.next_diagnosis)} '
-                  f'(не позднее {_fmt(params.max_diag_interval, 0)} лет).'))
+                  f'(не позднее {years_to_text(params.max_diag_interval)}).'))
     if not conclusions:
         conclusions.append((GREEN, 'Оборудование ГРП находится в пределах '
                                    'нормативного срока службы.'))

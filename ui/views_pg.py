@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from core.config import DB_CONFIG
 from core.models import Equipment
-from core.timefmt import years_to_text
+from core.timefmt import DurationError, parse_years_strict, years_to_text
 from db.database_pg import DatabasePG
 from integration import excel_sync, word_report_pg
 from integration.pdf_parts_import import scan_pdf, import_to_db, create_catalog_equipment
@@ -16,6 +16,7 @@ from logic.statistic_analyzer import StatisticsAnalyzer
 from logic.technical_analyzer_pg import TechnicalAnalyzer
 
 from .algorithms_view import AlgorithmsWindow
+from .window_utils import fit_window, resize_root
 
 # Варианты вида работ при замене запасной части (как в образце Лида.xlsx)
 WORK_TYPES = [
@@ -176,7 +177,6 @@ class GRPAppPG:
 
     def setup_ui(self):
         self.root.title("🏭 Система анализа ГРП (PostgreSQL)")
-        self.root.geometry("1350x780")
 
         # Настройка стилей
         style = ttk.Style()
@@ -248,6 +248,9 @@ class GRPAppPG:
         # Показываем стартовый экран (пустая таблица, ГРП не выбран)
         self.show_view("grp")
 
+        # Окно по содержимому, но не больше экрана
+        self.root.after(60, lambda: resize_root(self.root, min_width=1100, min_height=700))
+
     def _build_menu(self):
         """Сборка серого меню слева из MENU_STRUCTURE."""
         self.menu_buttons = {}
@@ -289,10 +292,18 @@ class GRPAppPG:
         return info[0] if info else None
 
     def toggle_sidebar(self):
-        """Открыть/закрыть серое меню слева."""
+        """Открыть/закрыть серое меню.
+
+        Меню всегда возвращается СЛЕВА: pack() размещает виджет после уже
+        упакованных, поэтому без before=self.content повторное открытие
+        уводило панель вправо от контента.
+        """
         if self.sidebar.winfo_manager():
             self.sidebar.pack_forget()
-        else:
+            return
+        try:
+            self.sidebar.pack(side=tk.LEFT, fill=tk.Y, before=self.content)
+        except tk.TclError:
             self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
 
     def show_view(self, key: str):
@@ -343,7 +354,6 @@ class GRPAppPG:
 
         window = Toplevel(self.root)
         window.title("Выбрать ГРП")
-        window.geometry("680x440")
         window.transient(self.root)
         window.grab_set()
 
@@ -370,7 +380,7 @@ class GRPAppPG:
 
         for g in grps:
             tree.insert('', tk.END, values=(
-                g[0], g[1], g[2], g[3], g[4],
+                g[0], g[1], g[2], years_to_text(g[3]), years_to_text(g[4]),
                 len(self.db.get_equipment_by_grp(g[0])),
                 self.db.count_replacements_by_grp(g[0]),
             ))
@@ -390,6 +400,7 @@ class GRPAppPG:
         buttons.pack(pady=12)
         self._btn(buttons, "🗂 Выбрать", pick, color='primary', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(buttons, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
+        fit_window(window, min_width=760, min_height=420)
 
     def show_help(self):
         """Справка для новых пользователей."""
@@ -554,7 +565,6 @@ class GRPAppPG:
 
         add_window = Toplevel(self.root)
         add_window.title("Добавить запчасть")
-        add_window.geometry("480x260")
         add_window.transient(self.root)
         add_window.grab_set()
 
@@ -598,6 +608,7 @@ class GRPAppPG:
         btn_frame.pack(pady=12)
         self._btn(btn_frame, "💾 Добавить", do_add, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
         self._btn(btn_frame, "❌ Отмена", add_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+        fit_window(add_window, min_width=560, min_height=280)
 
     def _edit_selected_part_dates(self):
         ctx = self._current_selected_equip()
@@ -621,7 +632,6 @@ class GRPAppPG:
 
         edit_window = Toplevel(self.root)
         edit_window.title("Изменить даты запчасти")
-        edit_window.geometry("440x220")
         edit_window.transient(self.root)
         edit_window.grab_set()
 
@@ -658,6 +668,7 @@ class GRPAppPG:
         btn_frame.pack(pady=12)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
         self._btn(btn_frame, "❌ Отмена", edit_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+        fit_window(edit_window, min_width=480, min_height=260)
 
     def _edit_selected_part_norm(self):
         ctx = self._current_selected_equip()
@@ -678,7 +689,6 @@ class GRPAppPG:
         """Диалог изменения нормы (срока службы) запчасти."""
         norm_window = Toplevel(self.root)
         norm_window.title("Изменить норму запчасти")
-        norm_window.geometry("440x190")
         norm_window.transient(self.root)
         norm_window.grab_set()
 
@@ -688,29 +698,33 @@ class GRPAppPG:
         frame = tk.Frame(norm_window)
         frame.pack(pady=8)
 
-        tk.Label(frame, text="Срок службы (лет):", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
-        years_entry = tk.Entry(frame, width=12)
-        years_entry.insert(0, str(ep_data[3]))
+        tk.Label(frame, text="Срок службы:", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=5)
+        years_entry = tk.Entry(frame, width=16)
+        years_entry.insert(0, years_to_text(ep_data[3]))
         years_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
+        tk.Label(frame, text="например: 7 лет 4 мес или 7,3",
+                 font=("Arial", 8), fg="#6c757d").grid(row=1, column=1, sticky=tk.W)
 
         def save_norm():
             try:
-                years = float(years_entry.get())
+                years = parse_years_strict(years_entry.get(), "срок службы")
                 if years <= 0:
-                    raise ValueError
+                    raise DurationError("Срок службы должен быть больше нуля.")
                 self.db.update_part(ep_data[1], ep_data[2], years)
                 norm_window.destroy()
                 ctx = self._current_selected_equip()
                 if ctx:
                     self._refresh_parts_panel(ctx[0], ctx[1], ctx[2])
-                self.statusbar.config(text=f"Норма '{ep_data[2]}' = {years} лет")
-            except ValueError:
-                messagebox.showerror("Ошибка", "Неверный формат числа!")
+                self.statusbar.config(
+                    text=f"Норма '{ep_data[2]}' = {years_to_text(years)}")
+            except DurationError as e:
+                messagebox.showerror("Ошибка", str(e))
 
         btn_frame = tk.Frame(norm_window)
         btn_frame.pack(pady=12)
         self._btn(btn_frame, "💾 Сохранить", save_norm, color='success', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
         self._btn(btn_frame, "❌ Отмена", norm_window.destroy, color='danger', font_size=10, padx=15).pack(side=tk.LEFT, padx=8)
+        fit_window(norm_window, min_width=480, min_height=250)
 
     def _toggle_selected_part_replaceable(self):
         ctx = self._current_selected_equip()
@@ -1037,7 +1051,6 @@ class GRPAppPG:
 
         window = Toplevel(self.root)
         window.title(f"Добавить оборудование в каталог: {grp_name}")
-        window.geometry("520x240")
         window.transient(self.root)
         window.grab_set()
 
@@ -1071,6 +1084,7 @@ class GRPAppPG:
         btn_frame.pack(pady=15)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
+        fit_window(window, min_width=560, min_height=260)
 
     def _catalog_show_parts(self):
         """Показать запчасти выбранной модели в встроенной панели каталога."""
@@ -1217,12 +1231,12 @@ class GRPAppPG:
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         columns = ("ID", "Дата", "Номер запчасти", "Тип оборудования", "Модель",
-                   "Производитель", "Вид работ", "Причина", "ФИО")
+                   "Производитель", "Вид работ", "Причина", "ФИО", "Влияние на срок")
         self.repairs_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
 
-        col_widths = {"ID": 40, "Дата": 100, "Номер запчасти": 190, "Тип оборудования": 110,
-                      "Модель": 150, "Производитель": 150, "Вид работ": 200,
-                      "Причина": 300, "ФИО": 140}
+        col_widths = {"ID": 40, "Дата": 95, "Номер запчасти": 170, "Тип оборудования": 105,
+                      "Модель": 140, "Производитель": 140, "Вид работ": 190,
+                      "Причина": 280, "ФИО": 130, "Влияние на срок": 250}
         for col in columns:
             self.repairs_tree.heading(col, text=col)
             self.repairs_tree.column(col, width=col_widths.get(col, 120))
@@ -1235,7 +1249,9 @@ class GRPAppPG:
 
         tk.Label(self.repairs_tab,
                  text="💡 Замены хранятся в БД и автоматически записываются в файл «Замены.xlsx»\n"
-                      "(один лист «Ремонт …» на каждый ГРП, формат как в «Лида.xlsx»).",
+                      "(один лист «Ремонт …» на каждый ГРП, формат как в «Лида.xlsx»).\n"
+                      "⚙️ Если в записи выбрано «сбросить срок детали» или «заменить оборудование "
+                      "целиком», срок службы пересчитывается заново от даты замены.",
                  fg="#6c757d", font=("Arial", 9), justify=tk.CENTER).pack(pady=5)
 
     def load_replacements(self):
@@ -1249,57 +1265,192 @@ class GRPAppPG:
         for row in self.repairs_tree.get_children():
             self.repairs_tree.delete(row)
 
-        replacements = self.db.get_replacements_by_grp(grp_id)
-        for r in replacements:
-            self.repairs_tree.insert('', tk.END, values=r)
+        detailed = getattr(self.db, 'get_replacements_detailed', None)
+        rows = detailed(grp_id) if detailed else self.db.get_replacements_by_grp(grp_id)
+        effectful = 0
+        for r in rows:
+            if detailed:
+                record, eq_id, part_id, effect, _new_eq_id, eq_name, part_name = r[:9], *r[9:]
+                values = list(record) + [self._effect_label(effect, eq_name, part_name)]
+                if effect:
+                    effectful += 1
+            else:
+                values = list(r) + ['']
+            self.repairs_tree.insert('', tk.END, values=values)
 
-        self.statusbar.config(text=f"Замены ГРП «{grp_name}» (#{grp_id}): {len(replacements)} записей")
+        if detailed:
+            extra = (f", со сбросом срока: {effectful}" if effectful else "")
+            self.statusbar.config(
+                text=f"Замены ГРП «{grp_name}» (#{grp_id}): {len(rows)} записей{extra}")
+        else:
+            self.statusbar.config(
+                text=f"Замены ГРП «{grp_name}» (#{grp_id}): {len(rows)} записей")
         return grp_id
+
+    @staticmethod
+    def _effect_label(effect: str, eq_name: str = '', part_name: str = '') -> str:
+        """Человекочитаемая подпись влияния записи журнала на срок службы."""
+        if effect == 'part':
+            where = ' → '.join(x for x in (eq_name, part_name) if x)
+            return f'срок заново: {where}' if where else 'срок детали заново'
+        if effect == 'equipment':
+            return f'срок заново: {eq_name} (целиком)' if eq_name else 'срок оборудования заново'
+        return '—'
 
     def _replacement_dialog(self, grp_id: int, grp_name: str, repl: Optional[tuple] = None):
         """Окно добавления/редактирования замены. repl — кортеж из БД или None."""
         window = Toplevel(self.root)
         window.title(f"Замена — ГРП {grp_name}")
-        window.geometry("620x440")
         window.transient(self.root)
         window.grab_set()
 
         is_edit = repl is not None
         title = "✏ Редактирование замены" if is_edit else "➕ Добавление замены запчасти"
         tk.Label(window, text=f"{title}\nГРП #{grp_id}: {grp_name}",
-                 font=("Arial", 12, "bold"), fg="#546E7A" if is_edit else "#546E7A").pack(pady=10)
+                 font=("Arial", 12, "bold"), fg="#546E7A").pack(pady=10)
 
-        frame = tk.Frame(window)
-        frame.pack(pady=8)
+        body = tk.Frame(window)
+        body.pack(fill=tk.BOTH, expand=True, padx=12)
 
-        def ctrl(row, label, widget):
-            tk.Label(frame, text=label, font=("Arial", 10)).grid(row=row, column=0, sticky=tk.W, pady=5)
-            widget.grid(row=row, column=1, sticky=tk.W, pady=5)
+        def ctrl(row, label, widget, hint=None, col=0):
+            tk.Label(body, text=label, font=("Arial", 10)).grid(
+                row=row, column=col, sticky=tk.W, pady=5)
+            widget.grid(row=row, column=col + 1, sticky=tk.W, pady=5)
+            if hint:
+                tk.Label(body, text=hint, font=("Arial", 8),
+                         fg="#6c757d").grid(row=row, column=col + 2, sticky=tk.W, padx=6)
 
-        date_entry = tk.Entry(frame, width=34)
-        part_entry = tk.Entry(frame, width=34)
-        type_combo = ttk.Combobox(frame, width=32, values=EQUIPMENT_TYPES)
-        model_entry = tk.Entry(frame, width=34)
-        maker_entry = AutocompleteCombobox(frame, width=32, values=self.db.get_all_manufacturers())
-        work_combo = ttk.Combobox(frame, width=32, values=WORK_TYPES)
-        reason_entry = tk.Entry(frame, width=34)
-        boss_entry = tk.Entry(frame, width=34)
+        date_entry = tk.Entry(body, width=34)
+        part_entry = tk.Entry(body, width=34)
+        type_combo = ttk.Combobox(body, width=32, values=EQUIPMENT_TYPES)
+        model_entry = tk.Entry(body, width=34)
+        maker_entry = AutocompleteCombobox(body, width=32, values=self.db.get_all_manufacturers())
+        work_combo = ttk.Combobox(body, width=32, values=WORK_TYPES)
+        reason_entry = tk.Entry(body, width=34)
+        boss_entry = tk.Entry(body, width=34)
 
-        ctrl(0, "Дата замены:", date_entry)
+        ctrl(0, "Дата замены:", date_entry, "📝 05.2023 или 12.01.2023г.")
         ctrl(1, "Номер запчасти:", part_entry)
         ctrl(2, "Тип оборудования:", type_combo)
         ctrl(3, "Модель оборудования:", model_entry)
-        ctrl(4, "Производитель:", maker_entry)
+        ctrl(4, "Производитель:", maker_entry, "💡 начните вводить — список отфильтруется")
         ctrl(5, "Вид работ:", work_combo)
         ctrl(6, "Причина замены:", reason_entry)
         ctrl(7, "ФИО руководителя:", boss_entry)
 
-        tk.Label(frame,
-                 text="📝 дата можно указать как 05.2023 или 12.01.2023г. — как в журнале",
-                 font=("Arial", 8), fg="#6c757d").grid(row=0, column=2, sticky=tk.W, padx=6)
-        tk.Label(frame,
-                 text="💡 начните вводить — список отфильтруется",
-                 font=("Arial", 8), fg="#6c757d").grid(row=4, column=2, sticky=tk.W, padx=6)
+        # === Влияние записи на срок службы ===
+        effect_frame = tk.LabelFrame(
+            window, text="🔄 Влияние на срок службы (выберите заменённый объект)",
+            font=("Arial", 10, "bold"), padx=10, pady=6)
+        effect_frame.pack(fill=tk.X, padx=12, pady=(4, 0))
+
+        equipment = [e for e in self.db.get_equipment_by_grp(grp_id) if not e[3]]
+        eq_by_name = {e[1]: e for e in equipment}
+        eq_names = [e[1] for e in equipment]
+        removed_eq = {}
+        if is_edit and repl[9]:
+            # При редактировании записи о полной замене исходное оборудование
+            # уже снято — показываем его в списке, иначе выбор не восстановится.
+            old = next((e for e in self.db.get_equipment_by_grp(grp_id)
+                        if e[0] == repl[9] and e[3]), None)
+            if old and old[1] not in eq_by_name:
+                label = f'{old[1]} (снято {old[3]})'
+                removed_eq[label] = old
+                equipment.append((old[0], label, old[2], old[3]))
+                eq_by_name[label] = old
+                eq_names.append(label)
+
+        eq_combo = ttk.Combobox(effect_frame, width=32, values=eq_names, state="readonly")
+        part_combo = ttk.Combobox(effect_frame, width=32, state="readonly")
+        part_choice = {}          # подпись детали → (part_id, part_number, is_replaceable, norm)
+        eff_var = tk.StringVar(value='')
+
+        tk.Label(effect_frame, text="Оборудование:", font=("Arial", 9)).grid(
+            row=0, column=0, sticky=tk.E, padx=(0, 4), pady=3)
+        eq_combo.grid(row=0, column=1, sticky=tk.W, pady=3)
+        tk.Label(effect_frame, text="Деталь:", font=("Arial", 9)).grid(
+            row=1, column=0, sticky=tk.E, padx=(0, 4), pady=3)
+        part_combo.grid(row=1, column=1, sticky=tk.W, pady=3)
+        tk.Label(effect_frame, text="Что сделать со сроком:",
+                 font=("Arial", 9)).grid(row=2, column=0, sticky=tk.E, padx=(0, 4), pady=3)
+
+        effects = tk.Frame(effect_frame)
+        effects.grid(row=2, column=1, sticky=tk.W, pady=3)
+        eff_none = tk.Radiobutton(effects, text="только журнал",
+                                  variable=eff_var, value='', font=("Arial", 9))
+        eff_part = tk.Radiobutton(effects, text="сбросить срок детали",
+                                  variable=eff_var, value='part', font=("Arial", 9))
+        eff_eq = tk.Radiobutton(effects, text="заменить оборудование целиком",
+                                variable=eff_var, value='equipment', font=("Arial", 9))
+        eff_none.pack(side=tk.LEFT, padx=(0, 10))
+        eff_part.pack(side=tk.LEFT, padx=(0, 10))
+        eff_eq.pack(side=tk.LEFT)
+
+        effect_hint = tk.Label(effect_frame, text="", font=("Arial", 8),
+                               fg="#546E7A", anchor=tk.W, justify=tk.LEFT)
+        effect_hint.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+
+        def update_hint(*_args):
+            effect = eff_var.get()
+            if effect == '':
+                effect_hint.config(text="Срок службы не изменится — запись попадёт только в журнал.")
+            elif effect == 'part':
+                part_name = part_combo.get()
+                choice = part_choice.get(part_name)
+                if not choice:
+                    effect_hint.config(text="⚠️ Выберите деталь — без неё сбросить срок нечего.")
+                elif not choice[2]:
+                    effect_hint.config(
+                        text=f"⚠️ «{part_name}» не заменяемая: сброс срока возможен, "
+                             "но деталь не относится к расходным.")
+                else:
+                    effect_hint.config(
+                        text=f"✅ Срок «{part_name}» ({years_to_text(choice[3])}) "
+                             "будет отсчитываться заново с даты замены.")
+            else:
+                eq = eq_by_name.get(eq_combo.get())
+                if not eq:
+                    effect_hint.config(text="⚠️ Выберите оборудование.")
+                elif eq[3]:
+                    effect_hint.config(
+                        text=f"ℹ «{eq[1]}» уже снято с эксплуатации "
+                             f"{eq[3]} — повторная замена не выполняется.")
+                else:
+                    n = len([p for p in self.db.get_equipment_parts_full(eq[0]) if not p[5]])
+                    effect_hint.config(
+                        text=f"✅ Оборудование «{eq[1]}» будет снято {date_entry.get().strip() or '—'}, "
+                             f"создано новое, сроки всех {n} деталей — заново.")
+
+        def active_parts(eq):
+            """Активные детали оборудования: подпись → (part_id, номер, заменяемая, норма)."""
+            found = {}
+            if not eq:
+                return found
+            for _ep_id, pid, name, norm, _inst, removal, pnum, is_repl in \
+                    self.db.get_equipment_parts_full(eq[0]):
+                if removal:
+                    continue
+                found[f"{name}" + (f" · {pnum}" if pnum else "")] = (
+                    pid, pnum or "", is_repl, norm)
+            return found
+
+        def on_eq_change(_event=None):
+            eq = eq_by_name.get(eq_combo.get())
+            found = active_parts(eq)
+            part_choice.clear()
+            part_choice.update(found)
+            part_combo.configure(values=list(found))
+            part_combo.set('')
+            if eq and not model_entry.get().strip():
+                model_entry.insert(0, eq[1])
+                type_combo.set(self._equipment_type_by_model(eq[1]))
+            update_hint()
+
+        eq_combo.bind('<<ComboboxSelected>>', on_eq_change)
+        part_combo.bind('<<ComboboxSelected>>', update_hint)
+        for var in (eff_var,):
+            var.trace_add('write', update_hint)
+        date_entry.bind('<KeyRelease>', update_hint)
 
         if is_edit:
             date_entry.insert(0, repl[1] or "")
@@ -1310,10 +1461,64 @@ class GRPAppPG:
             work_combo.set(repl[6] or "")
             reason_entry.insert(0, repl[7] or "")
             boss_entry.insert(0, repl[8] or "")
+            eq_id, part_id, effect = repl[9], repl[10], repl[11]
+            if eq_id:
+                eq = next((e for e in equipment if e[0] == eq_id), None)
+                if eq:
+                    eq_combo.set(eq[1])
+                    on_eq_change()
+            if part_id and not eq_id:
+                # привязка только к детали: ищем оборудование, где она установлена
+                for cand in equipment:
+                    if any(c[0] == part_id for c in active_parts(cand).values()):
+                        eq_combo.set(cand[1])
+                        on_eq_change()
+                        break
+            for label, choice in part_choice.items():
+                if choice[0] == part_id:
+                    part_combo.set(label)
+                    break
+            eff_var.set(effect or '')
+        update_hint()
 
         def save():
+            effect = eff_var.get()
+            eq = eq_by_name.get(eq_combo.get())
+            part_id = part_number = None
+            if effect == 'part':
+                choice = part_choice.get(part_combo.get())
+                if not choice:
+                    messagebox.showerror(
+                        "Ошибка",
+                        "Выбран режим «сбросить срок детали», но деталь не указана.\n\n"
+                        "Выберите деталь в списке или переключите режим на «только журнал».")
+                    return
+                part_id, part_number, _is_repl, _norm = choice
+                part_entry.delete(0, tk.END)
+                part_entry.insert(0, part_number)
+            elif effect == 'equipment':
+                if not eq:
+                    messagebox.showerror(
+                        "Ошибка",
+                        "Выбран режим «заменить оборудование целиком», "
+                        "но оборудование не указано.")
+                    return
+                model_entry.delete(0, tk.END)
+                model_entry.insert(0, eq[1])
+                type_combo.set(self._equipment_type_by_model(eq[1]))
+
+            date_text = date_entry.get().strip()
+            iso = self._to_iso_date(date_text)
+            if effect in ('part', 'equipment') and not iso:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Для сброса срока нужна дата в формате ДД.ММ.ГГГГ или ММ.ГГГГ.")
+                return
+            eq_id = eq[0] if eq else None
+
+            # Дату храним в ISO: откат эффекта сопоставляет её с install_date.
             data = (
-                date_entry.get().strip() or None,
+                iso or date_text or None,
                 part_entry.get().strip() or None,
                 type_combo.get().strip() or None,
                 model_entry.get().strip() or None,
@@ -1322,22 +1527,76 @@ class GRPAppPG:
                 reason_entry.get().strip() or None,
                 boss_entry.get().strip() or None,
             )
+
+            prev_effect = (repl[11] or '') if is_edit else ''
+            prev_eq = repl[9] if is_edit else None
+            prev_part = repl[10] if is_edit else None
+            prev_date = (repl[1] or '') if is_edit else ''
+            prev_new_eq = repl[12] if is_edit else None
+            # Правка текста не должна заново менять физическое состояние:
+            # переустановка выполняется только если действие реально изменилось.
+            unchanged = (is_edit and effect == prev_effect and eq_id == prev_eq
+                         and part_id == prev_part
+                         and (iso or date_text) == prev_date)
+            apply_effect = effect in ('part', 'equipment') and not unchanged
+
+            if effect == 'equipment' and apply_effect:
+                active = [p for p in self.db.get_equipment_parts_full(eq_id) if not p[5]]
+                if not messagebox.askyesno(
+                        "Подтверждение замены оборудования",
+                        f"Оборудование «{eq[1]}» будет полностью заменено {date_text}.\n\n"
+                        f"Оно и все его детали ({len(active)} шт.) будут сняты с "
+                        f"эксплуатации {date_text}, будет создано новое оборудование, "
+                        f"и срок службы каждой детали начнётся заново.\n\n"
+                        f"Прежняя история деталей сохранится. Продолжить?"):
+                    return
+            new_eq_id = None
             try:
+                if apply_effect and effect == 'equipment' and eq[3]:
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Оборудование «{eq[1]}» уже снято с эксплуатации {eq[3]}.\n\n"
+                        "Повторную замену выполнить нельзя. Удалите прежнюю запись "
+                        "о замене, если нужно вернуть срок службы.")
+                    return
+                reverted = ''
+                if is_edit and not unchanged and prev_effect in ('part', 'equipment'):
+                    reverted = self.db.revert_replacement_effect(repl[0])
+                if effect == 'part' and apply_effect:
+                    self.db.replace_equipment_part(eq_id, part_id, iso)
+                elif effect == 'equipment' and apply_effect:
+                    new_eq_id = self.db.replace_equipment_completely(
+                        eq_id, iso, add_journal=False)
                 if is_edit:
-                    self.db.update_replacement(repl[0], *data)
+                    self.db.update_replacement(
+                        repl[0], *data, equipment_id=eq_id, part_id=part_id,
+                        effect=effect, new_equipment_id=(new_eq_id or prev_new_eq),
+                        clear_links=(effect == ''))
                 else:
-                    self.db.add_replacement(grp_id, *data)
+                    self.db.add_replacement(
+                        grp_id, *data, equipment_id=eq_id, part_id=part_id,
+                        effect=effect, new_equipment_id=new_eq_id)
                 window.destroy()
                 self.load_replacements()
+                self.load_home()
                 self.sync_excel(silent=True)
-                self.statusbar.config(text="Замена сохранена, Excel обновлён")
+                notes = {
+                    '': "срок не изменён",
+                    'part': f"срок детали отсчитывается заново с {date_text}",
+                    'equipment': f"оборудование заменено {date_text}, сроки заново",
+                }
+                extra = f" ({reverted})" if reverted else ""
+                extra += " — прежняя замена не применялась повторно" if unchanged else ""
+                self.statusbar.config(
+                    text=f"Замена сохранена, Excel обновлён — {notes[effect]}{extra}")
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
 
         btn_frame = tk.Frame(window)
-        btn_frame.pack(pady=15)
+        btn_frame.pack(pady=10)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
+        fit_window(window, min_width=700, min_height=560)
 
     def add_replacement(self):
         grp = self._current_grp()
@@ -1355,8 +1614,12 @@ class GRPAppPG:
 
     @staticmethod
     def _to_iso_date(value: str) -> Optional[str]:
-        """'ДД.ММ.ГГГГ' / 'ММ.ГГГГ' → 'ГГГГ-ММ-ДД' (для дат запчастей)."""
+        """'ГГГГ-ММ-ДД' / 'ДД.ММ.ГГГГ' / 'ММ.ГГГГ' → 'ГГГГ-ММ-ДД'."""
         value = (value or '').strip()
+        m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})', value)
+        if m:
+            year, month, day = m.group(1), int(m.group(2)), int(m.group(3))
+            return f'{year}-{month:02d}-{day:02d}'
         m = re.match(r'^(\d{1,2})[.\-](\d{1,2})[.\-](\d{2,4})', value)
         if m:
             day, month, year = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -1385,7 +1648,6 @@ class GRPAppPG:
     def _replace_part_dialog(self, grp_id: int, grp_name: str):
         window = Toplevel(self.root)
         window.title(f"🔧 Замена запчасти — ГРП {grp_name}")
-        window.geometry("980x640")
         window.transient(self.root)
         window.grab_set()
 
@@ -1532,7 +1794,9 @@ class GRPAppPG:
             )
             try:
                 self.db.replace_equipment_part(eq[0], part_id, iso)
-                self.db.add_replacement(grp_id, *data)
+                self.db.add_replacement(grp_id, *data,
+                                        equipment_id=eq[0], part_id=part_id,
+                                        effect='part')
                 load_equipment_parts(eq)
                 self.load_home()
                 self.load_replacements()
@@ -1579,12 +1843,15 @@ class GRPAppPG:
 
             try:
                 new_id = self.db.replace_equipment_completely(
-                    eq_id, iso,
-                    equipment_type=self._equipment_type_by_model(eq[1]),
-                    work_type=work_combo.get().strip() or 'Замена',
-                    reason=reason_entry.get().strip() or None,
-                    supervisor=boss_entry.get().strip() or None,
-                    grp_id=grp_id)
+                    eq_id, iso, add_journal=False)
+                self.db.add_replacement(
+                    grp_id, date_input, 'полная замена оборудования',
+                    self._equipment_type_by_model(eq[1]), eq[1], None,
+                    work_combo.get().strip() or 'Замена',
+                    reason_entry.get().strip() or None,
+                    boss_entry.get().strip() or None,
+                    equipment_id=eq_id, effect='equipment',
+                    new_equipment_id=new_id)
                 self.load_home()
                 self.load_replacements()
                 self.sync_excel(silent=True)
@@ -1610,6 +1877,7 @@ class GRPAppPG:
                   replace_whole_equipment, color='primary', font_size=10,
                   padx=20).pack(side=tk.LEFT, padx=8)
         self._btn(btn_frame, "❌ Закрыть", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=8)
+        fit_window(window, min_width=900, min_height=560)
 
     def edit_replacement(self):
         grp = self._current_grp()
@@ -1619,22 +1887,41 @@ class GRPAppPG:
         if not selected:
             messagebox.showwarning("Внимание", "Выберите замену из списка!")
             return
-        values = self.repairs_tree.item(selected[0])['values']
-        self._replacement_dialog(grp[0], grp[1], tuple(values))
+        repl_id = int(self.repairs_tree.item(selected[0])['values'][0])
+        # Полная запись из БД: в Treeview нет equipment_id/part_id/effect,
+        # без них редактирование записи сбросила бы метку влияния на срок.
+        record = self.db.get_replacement(repl_id)
+        if not record:
+            messagebox.showerror("Ошибка", f"Запись #{repl_id} не найдена в базе.")
+            return
+        self._replacement_dialog(grp[0], grp[1], record)
 
     def delete_replacement(self):
         selected = self.repairs_tree.selection()
         if not selected:
             messagebox.showwarning("Внимание", "Выберите замену из списка!")
             return
-        repl_id = int(self.repairs_tree.item(selected[0])['values'][0])
-        part_number = self.repairs_tree.item(selected[0])['values'][2]
+        values = self.repairs_tree.item(selected[0])['values']
+        repl_id = int(values[0])
+        part_number = values[2]
+        effect_text = values[9] if len(values) > 9 else ''
 
-        if messagebox.askyesno("Подтверждение", f"Удалить замену '{part_number}' (ID={repl_id})?"):
-            self.db.delete_replacement(repl_id)
-            self.load_replacements()
-            self.sync_excel(silent=True)
-            self.statusbar.config(text=f"Замена #{repl_id} удалена, Excel обновлён")
+        question = f"Удалить замену '{part_number}' (ID={repl_id})?"
+        if effect_text and effect_text != '—':
+            question += ("\n\nЗапись сбрасывала срок службы, и срок будет "
+                         "восстановлен на прежний.")
+        if not messagebox.askyesno("Подтверждение", question):
+            return
+        try:
+            restored = self.db.revert_replacement_effect(repl_id)
+        except AttributeError:
+            restored = ''
+        self.db.delete_replacement(repl_id)
+        self.load_replacements()
+        self.load_home()
+        self.sync_excel(silent=True)
+        note = f", {restored}" if restored else ""
+        self.statusbar.config(text=f"Замена #{repl_id} удалена{note}, Excel обновлён")
 
     def sync_excel(self, silent: bool = False):
         """Перезаписать файл «Замены.xlsx» из БД."""
@@ -1718,7 +2005,6 @@ class GRPAppPG:
     def add_grp(self):
         window = Toplevel(self.root)
         window.title("Добавить ГРП")
-        window.geometry("400x350")
         window.transient(self.root)
         window.grab_set()
 
@@ -1736,13 +2022,17 @@ class GRPAppPG:
         lines_entry = tk.Entry(frame, width=20)
         lines_entry.grid(row=1, column=1, pady=5)
 
-        tk.Label(frame, text="Фактический срок (лет):", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
+        tk.Label(frame, text="Фактический срок:", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
         actual_entry = tk.Entry(frame, width=20)
         actual_entry.grid(row=2, column=1, pady=5)
 
-        tk.Label(frame, text="Проектный срок (лет):", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
+        tk.Label(frame, text="Проектный срок:", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
         design_entry = tk.Entry(frame, width=20)
         design_entry.grid(row=3, column=1, pady=5)
+
+        tk.Label(frame, text="срок можно ввести как «7 лет 4 мес», «7,3» или просто «7,3 года»",
+                 font=("Arial", 8), fg="#6c757d").grid(row=4, column=0, columnspan=2,
+                                                         sticky=tk.W, pady=(0, 4))
 
         def save():
             try:
@@ -1750,19 +2040,25 @@ class GRPAppPG:
                 if not grp_type:
                     messagebox.showerror("Ошибка", "Введите тип ГРП!")
                     return
+                try:
+                    lines = int(lines_entry.get().strip())
+                except ValueError:
+                    messagebox.showerror("Ошибка", "Количество линий — целое число!")
+                    return
+                actual = parse_years_strict(actual_entry.get(), "фактический срок")
+                design = parse_years_strict(design_entry.get(), "проектный срок")
 
-                new_id = self.db.add_grp(
-                    grp_type,
-                    int(lines_entry.get()),
-                    float(actual_entry.get()),
-                    float(design_entry.get())
-                )
+                new_id = self.db.add_grp(grp_type, lines, actual, design)
                 window.destroy()
                 self.set_current_grp(new_id)
                 self.statusbar.config(text=f"Добавлен ГРП: {grp_type}")
-                messagebox.showinfo("Успех", "✅ ГРП добавлен и выбран!")
-            except ValueError as e:
-                messagebox.showerror("Ошибка", f"Неверный формат данных: {e}")
+                messagebox.showinfo(
+                    "Успех",
+                    f"✅ ГРП добавлен и выбран!\n\n"
+                    f"Фактический срок: {years_to_text(actual)}\n"
+                    f"Проектный срок: {years_to_text(design)}")
+            except DurationError as e:
+                messagebox.showerror("Ошибка", str(e))
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
 
@@ -1770,6 +2066,7 @@ class GRPAppPG:
         btn_frame.pack(pady=20)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
+        fit_window(window, min_width=560, min_height=380)
 
     def edit_grp(self):
         """Редактирование выбранного ГРП"""
@@ -1782,7 +2079,6 @@ class GRPAppPG:
 
         window = Toplevel(self.root)
         window.title(f"Редактирование ГРП ID={grp_id}")
-        window.geometry("450x380")
         window.transient(self.root)
         window.grab_set()
 
@@ -1802,15 +2098,19 @@ class GRPAppPG:
         lines_entry.insert(0, str(grp_data[2]))
         lines_entry.grid(row=1, column=1, pady=5)
 
-        tk.Label(frame, text="Фактический срок (лет):", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
+        tk.Label(frame, text="Фактический срок:", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
         actual_entry = tk.Entry(frame, width=20)
-        actual_entry.insert(0, str(grp_data[3]))
+        actual_entry.insert(0, years_to_text(grp_data[3]))
         actual_entry.grid(row=2, column=1, pady=5)
 
-        tk.Label(frame, text="Проектный срок (лет):", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
+        tk.Label(frame, text="Проектный срок:", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
         design_entry = tk.Entry(frame, width=20)
-        design_entry.insert(0, str(grp_data[4]))
+        design_entry.insert(0, years_to_text(grp_data[4]))
         design_entry.grid(row=3, column=1, pady=5)
+
+        tk.Label(frame, text="срок можно ввести как «7 лет 4 мес», «7,3» или просто «7,3 года»",
+                 font=("Arial", 8), fg="#6c757d").grid(row=4, column=0, columnspan=2,
+                                                         sticky=tk.W, pady=(0, 4))
 
         def save():
             try:
@@ -1818,20 +2118,21 @@ class GRPAppPG:
                 if not grp_type:
                     messagebox.showerror("Ошибка", "Введите тип ГРП!")
                     return
+                try:
+                    lines = int(lines_entry.get().strip())
+                except ValueError:
+                    messagebox.showerror("Ошибка", "Количество линий — целое число!")
+                    return
+                actual = parse_years_strict(actual_entry.get(), "фактический срок")
+                design = parse_years_strict(design_entry.get(), "проектный срок")
 
-                self.db.update_grp(
-                    grp_id,
-                    grp_type,
-                    int(lines_entry.get()),
-                    float(actual_entry.get()),
-                    float(design_entry.get())
-                )
+                self.db.update_grp(grp_id, grp_type, lines, actual, design)
                 messagebox.showinfo("Успех", "✅ ГРП обновлён!")
                 window.destroy()
                 self.set_current_grp(grp_id)
                 self.statusbar.config(text=f"ГРП #{grp_id} обновлён")
-            except ValueError as e:
-                messagebox.showerror("Ошибка", f"Неверный формат данных: {e}")
+            except DurationError as e:
+                messagebox.showerror("Ошибка", str(e))
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
 
@@ -1839,6 +2140,7 @@ class GRPAppPG:
         btn_frame.pack(pady=20)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
+        fit_window(window, min_width=560, min_height=420)
 
     def delete_grp(self):
         """Удаление выбранного ГРП (вместе с оборудованием и историей)"""
@@ -1869,7 +2171,6 @@ class GRPAppPG:
 
         window = Toplevel(self.root)
         window.title(f"Добавить оборудование в ГРП {grp_name}")
-        window.geometry("500x450")
         window.transient(self.root)
         window.grab_set()
 
@@ -1929,6 +2230,7 @@ class GRPAppPG:
         btn_frame.pack(pady=20)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
+        fit_window(window, min_width=620, min_height=420)
 
     def view_equipment(self):
         """Показать оборудование и запчасти в главном окне (выбранный ГРП)."""
@@ -1991,7 +2293,6 @@ class GRPAppPG:
 
         window = Toplevel(self.root)
         window.title(f"⚠️ Предупреждения - ГРП {grp_name}")
-        window.geometry("900x600")
         window.transient(self.root)
 
         text_area = scrolledtext.ScrolledText(window, wrap=tk.WORD, font=("Courier", 10))
@@ -2043,6 +2344,7 @@ class GRPAppPG:
         btn_frame.pack(pady=10)
         self._btn(btn_frame, "💾 Сохранить", export_warnings, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
         self._btn(btn_frame, "✖ Закрыть", window.destroy, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
+        fit_window(window, min_width=760, min_height=480)
 
     def add_tech_diagnostic(self):
         grp = self._current_grp()
@@ -2062,7 +2364,6 @@ class GRPAppPG:
 
         window = Toplevel(self.root)
         window.title("Техническое диагностирование")
-        window.geometry("620x700")
         window.transient(self.root)
         window.grab_set()
 
@@ -2215,6 +2516,7 @@ class GRPAppPG:
         btn_frame.pack(pady=16)
         self._btn(btn_frame, "🧮 Рассчитать и сохранить", calculate_and_save, color='indigo', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
+        fit_window(window, min_width=700, min_height=600)
 
     def load_tech_history(self):
         grp = self._current_grp()
@@ -2300,7 +2602,6 @@ class GRPAppPG:
 
         select_window = Toplevel(self.root)
         select_window.title("Выбор оборудования для анализа")
-        select_window.geometry("500x500")
         select_window.transient(self.root)
         select_window.grab_set()
 
@@ -2344,7 +2645,6 @@ class GRPAppPG:
 
             result_window = Toplevel(self.root)
             result_window.title(f"Статистика: {equip_name}")
-            result_window.geometry("850x650")
             result_window.transient(self.root)
 
             text_area = scrolledtext.ScrolledText(result_window, wrap=tk.WORD, font=("Courier", 10))
@@ -2422,9 +2722,11 @@ class GRPAppPG:
 
             self._btn(btn_frame, "💾 Сохранить отчет", export_stats, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
             self._btn(btn_frame, "✖ Закрыть", result_window.destroy, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
+            fit_window(result_window, min_width=820, min_height=560)
 
         self._btn(select_window, "🔍 Анализировать выбранное", analyze_selected, color='info', font_size=10, padx=15).pack(pady=10)
         self._btn(select_window, "❌ Отмена", select_window.destroy, color='danger', font_size=10, padx=20).pack(pady=5)
+        fit_window(select_window, min_width=460, min_height=520)
 
     def update_catalog_combo(self):
         """Обновление списка ГРП-каталогов в разделе «Каталог оборудования»."""
@@ -2457,8 +2759,7 @@ class GRPAppPG:
             return
 
         try:
-            from .algorithms_view import AlgorithmsWindow
-            AlgorithmsWindow(self.root, self.db, grp_id, equipment_data)
+            AlgorithmsWindow(self.root, self.db, grp_id, equipment_data, grp_name)
             self.statusbar.config(text=f"Открыт расчёт алгоритмов для ГРП: {grp_name}")
         except ImportError as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить модуль algorithms_view: {e}")

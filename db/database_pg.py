@@ -221,7 +221,19 @@ class DatabasePG:
                 CREATE INDEX IF NOT EXISTS idx_replacements_grp_id ON replacements(grp_id);
             ''')
 
-        print("✅ База данных PostgreSQL инициализирована!")
+            # 7.1 Связь записи журнала с физическим объектом.
+            # effect: '' — журнал без влияния на срок, 'part' — сброшен срок
+            # детали, 'equipment' — сброшены сроки всего оборудования.
+            # Внешних ключей намеренно нет: журнал — исторический документ и
+            # должен пережить удаление оборудования.
+            for column, dtype in (('equipment_id', 'INTEGER'),
+                                  ('part_id', 'INTEGER'),
+                                  ('new_equipment_id', 'INTEGER'),
+                                  ('effect', "VARCHAR(16) NOT NULL DEFAULT ''")):
+                cursor.execute(
+                    f'ALTER TABLE replacements ADD COLUMN IF NOT EXISTS {column} {dtype}')
+
+            print("✅ База данных PostgreSQL инициализирована!")
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ГРП ===
 
@@ -669,40 +681,85 @@ class DatabasePG:
 
     def add_replacement(self, grp_id: int, replace_date: str, part_number: str,
                         equipment_type: str, model: str, manufacturer: str,
-                        work_type: str, reason: str, supervisor: str) -> int:
-        """Добавление записи о замене запасной части."""
+                        work_type: str, reason: str, supervisor: str,
+                        equipment_id: int = None, part_id: int = None,
+                        effect: str = '', new_equipment_id: int = None) -> int:
+        """Добавление записи о замене запасной части.
+
+        equipment_id / part_id / effect связывают запись с физическим объектом
+        и определяют, что делает запись со сроком службы:
+          effect=''         — только журнал, сроки не меняются;
+          effect='part'     — срок детали отсчитывается заново с replace_date;
+          effect='equipment' — срок всего оборудования (new_equipment_id).
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO replacements
                 (grp_id, replace_date, part_number, equipment_type, model, manufacturer,
-                 work_type, reason, supervisor)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 work_type, reason, supervisor, equipment_id, part_id, effect, new_equipment_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             ''', (grp_id, replace_date, part_number, equipment_type, model, manufacturer,
-                  work_type, reason, supervisor))
+                  work_type, reason, supervisor, equipment_id, part_id,
+                  effect or '', new_equipment_id))
             return cursor.fetchone()[0]
 
     def update_replacement(self, repl_id: int, replace_date: str, part_number: str,
                            equipment_type: str, model: str, manufacturer: str,
-                           work_type: str, reason: str, supervisor: str):
-        """Обновление записи о замене запасной части."""
+                           work_type: str, reason: str, supervisor: str,
+                           equipment_id: int = None, part_id: int = None,
+                           effect: str = None, new_equipment_id: int = None,
+                           clear_links: bool = False):
+        """Обновление записи о замене запасной части.
+
+        effect=None — оставить прежнюю привязку к оборудованию/детали;
+        effect='' — привязка остаётся, но запись на сроки не влияет.
+        clear_links=True — привязку снести (NULL), в том числе effect.
+        """
+        if clear_links:
+            equipment_id = part_id = new_equipment_id = None
+            effect = effect or ''
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE replacements
                 SET replace_date = %s, part_number = %s, equipment_type = %s, model = %s,
                     manufacturer = %s, work_type = %s, reason = %s, supervisor = %s,
+                    equipment_id = COALESCE(%s, equipment_id),
+                    part_id = COALESCE(%s, part_id),
+                    effect = COALESCE(%s, effect),
+                    new_equipment_id = COALESCE(%s, new_equipment_id),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
             ''', (replace_date, part_number, equipment_type, model, manufacturer,
-                  work_type, reason, supervisor, repl_id))
+                  work_type, reason, supervisor, equipment_id, part_id, effect,
+                  new_equipment_id, repl_id))
+            if clear_links:
+                cursor.execute('''
+                    UPDATE replacements
+                    SET equipment_id = NULL, part_id = NULL, new_equipment_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                ''', (repl_id,))
 
     def delete_replacement(self, repl_id: int):
         """Удаление записи о замене."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM replacements WHERE id = %s', (repl_id,))
+
+    def get_replacement(self, repl_id: int) -> Optional[Tuple]:
+        """Одна запись журнала: 9 полей записи + equipment_id, part_id, effect, new_equipment_id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, replace_date, part_number, equipment_type, model,
+                       manufacturer, work_type, reason, supervisor,
+                       equipment_id, part_id, effect, new_equipment_id
+                FROM replacements WHERE id = %s
+            ''', (repl_id,))
+            return cursor.fetchone()
 
     def get_replacements_by_grp(self, grp_id: int) -> List[Tuple]:
         """Замены по ГРП.
@@ -720,6 +777,70 @@ class DatabasePG:
                 ORDER BY replace_date NULLS LAST, id
             ''', (grp_id,))
             return cursor.fetchall()
+
+    def get_replacements_detailed(self, grp_id: int) -> List[Tuple]:
+        """Замены по ГРП с привязкой к физическому объекту.
+
+        Кортежи: (id, replace_date, part_number, equipment_type, model,
+        manufacturer, work_type, reason, supervisor, equipment_id, part_id,
+        effect, new_equipment_id, equipment_name, part_name).
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT r.id, r.replace_date, r.part_number, r.equipment_type, r.model,
+                       r.manufacturer, r.work_type, r.reason, r.supervisor,
+                       r.equipment_id, r.part_id, r.effect, r.new_equipment_id,
+                       e.name, p.name
+                FROM replacements r
+                LEFT JOIN equipment e ON e.id = r.equipment_id
+                LEFT JOIN parts p ON p.id = r.part_id
+                WHERE r.grp_id = %s
+                ORDER BY r.replace_date NULLS LAST, r.id
+            ''', (grp_id,))
+            return cursor.fetchall()
+
+    def revert_replacement_effect(self, repl_id: int) -> str:
+        """Отменить влияние записи журнала на сроки.
+
+        Возвращает описание того, что восстановлено ('' — ничего не менялось).
+        """
+        record = self.get_replacement(repl_id)
+        if not record or record[11] not in ('part', 'equipment'):
+            return ''
+        _, replace_date, _pn, _et, _model, _man, _work, _reason, _sup, \
+            equipment_id, part_id, effect, new_equipment_id = record
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if effect == 'part' and equipment_id and part_id:
+                cursor.execute('''
+                    DELETE FROM equipment_parts
+                    WHERE id = (SELECT id FROM equipment_parts
+                                WHERE equipment_id = %s AND part_id = %s
+                                  AND removal_date IS NULL AND install_date::text = %s
+                                ORDER BY id DESC LIMIT 1)
+                ''', (equipment_id, part_id, replace_date))
+                cursor.execute('''
+                    UPDATE equipment_parts SET removal_date = NULL
+                    WHERE id = (SELECT id FROM equipment_parts
+                                WHERE equipment_id = %s AND part_id = %s
+                                  AND removal_date::text = %s
+                                ORDER BY id DESC LIMIT 1)
+                ''', (equipment_id, part_id, replace_date))
+                return 'срок детали восстановлен'
+            if effect == 'equipment' and equipment_id:
+                if new_equipment_id:
+                    cursor.execute('DELETE FROM equipment WHERE id = %s', (new_equipment_id,))
+                cursor.execute(
+                    'UPDATE equipment SET removal_date = NULL, updated_at = CURRENT_TIMESTAMP '
+                    'WHERE id = %s', (equipment_id,))
+                cursor.execute('''
+                    UPDATE equipment_parts SET removal_date = NULL
+                    WHERE equipment_id = %s AND removal_date::text = %s
+                      AND (install_date::text IS DISTINCT FROM %s)
+                ''', (equipment_id, replace_date, replace_date))
+                return 'срок оборудования восстановлен'
+        return ''
 
     def count_replacements_by_grp(self, grp_id: int) -> int:
         """Количество замен по ГРП."""
