@@ -346,7 +346,18 @@ class DatabasePG:
             row = cursor.fetchone()
             if row:
                 return row[0]
-            return self.get_part_by_name(name)[0]
+            # Деталь уже была в справочнике: ON CONFLICT ничего не вставил.
+            existing = self.get_part_by_name(name)
+            if existing is None:
+                # Строка не нашлась — имя отличается от записанного в БД
+                # (регистр, пробелы) либо его удалили между запросами.
+                # Раньше здесь возникал TypeError: NoneType не поддерживает
+                # индексацию, и импорт падал без внятной причины.
+                raise ValueError(
+                    f'Не удалось добавить запчасть «{name}»: запись с таким '
+                    f'именем уже существует, но прочитать её не удалось. '
+                    f'Проверьте имя на совпадение (регистр, лишние пробелы).')
+            return existing[0]
 
     def update_part(self, part_id: int, name: str, norm_years: float):
         """Обновление типа запчасти"""

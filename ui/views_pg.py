@@ -6,13 +6,14 @@ from datetime import datetime
 from typing import List, Optional
 
 from core.config import DB_CONFIG
+from core.lifetimes import part_remaining
 from core.models import Equipment
 from core.timefmt import DurationError, parse_years_strict, years_to_text
 from db.database_pg import DatabasePG
 from integration import excel_sync, word_report_pg
 from integration.pdf_parts_import import scan_pdf, import_to_db, create_catalog_equipment
+from logic.algorithms import AlgorithmParams
 from logic.documentary_analyzer import DocumentaryAnalyzer
-from logic.statistic_analyzer import StatisticsAnalyzer
 from logic.technical_analyzer_pg import TechnicalAnalyzer
 
 from .algorithms_view import AlgorithmsWindow
@@ -116,6 +117,10 @@ class GRPAppPG:
         self.tech_analyzer = TechnicalAnalyzer()
         self.current_grp_id: Optional[int] = None
         self.current_grp_name: str = ""
+        # Параметры расчёта, заданные пользователем в окне алгоритмов.
+        # Отчёт Word должен считаться с ними же, иначе числа в отчёте
+        # разойдутся с тем, что пользователь видел на экране.
+        self.calc_params: Optional[AlgorithmParams] = None
         self.setup_ui()
         self.update_catalog_combo()
         self.sync_excel(silent=True)
@@ -140,23 +145,7 @@ class GRPAppPG:
             equip.install_date if hasattr(equip, 'install_date') else None
         )
 
-    @staticmethod
-    def _part_remaining_life(part_install: Optional[str], equip_install: Optional[str],
-                             norm_years) -> Optional[float]:
-        """Остаток ресурса одной детали, лет.
-
-        Считается от даты установки самой детали (последней замены), а если она
-        не задана — от даты установки оборудования. Если нет ни одной даты,
-        остаток неизвестен и возвращается None.
-        """
-        start = (DocumentaryAnalyzer._parse_date(part_install)
-                 or DocumentaryAnalyzer._parse_date(equip_install))
-        if start is None:
-            return None
-        try:
-            return float(norm_years) - (datetime.now().date() - start).days / 365.25
-        except (TypeError, ValueError):
-            return None
+    _part_remaining_life = staticmethod(part_remaining)
 
     def _btn(self, parent, text, command, color='primary', font_size=9, padx=10, **extra):
         """Единая цветная кнопка интерфейса с эффектом наведения."""
@@ -742,7 +731,8 @@ class GRPAppPG:
         self.db.update_part_replaceable(ep_data[1], not ep_data[7])
         self._refresh_parts_panel(equip_id, ctx[1], ctx[2])
         part = self.db.get_part_by_name(ep_data[2])
-        self.statusbar.config(text=f"Запчасть '{ep_data[2]}' — {'заменяемая (5 лет)' if part[3] else 'не заменяемая'}")
+        mark = 'заменяемая (5 лет)' if part and part[3] else 'не заменяемая'
+        self.statusbar.config(text=f"Запчасть '{ep_data[2]}' — {mark}")
 
     def _remove_selected_part(self):
         ctx = self._current_selected_equip()
@@ -859,13 +849,6 @@ class GRPAppPG:
             return
         self.show_view("tech")
         self.load_tech_history()
-
-    def view_stats(self):
-        """Перейти к статистике выбранного ГРП."""
-        if self._current_grp() is None:
-            return
-        self.show_view("stats")
-        self.show_statistics()
 
     def view_catalog(self):
         self.show_view("catalog")
@@ -1195,7 +1178,8 @@ class GRPAppPG:
         self.db.update_part_replaceable(ep_data[1], not ep_data[7])
         self._catalog_refresh_parts(equip_id, equip_name)
         part_row = self.db.get_part_by_name(ep_data[2])
-        self.statusbar.config(text=f"Запчасть '{ep_data[2]}' — {'заменяемая (5 лет)' if part_row[3] else 'не заменяемая'}")
+        mark = 'заменяемая (5 лет)' if part_row and part_row[3] else 'не заменяемая'
+        self.statusbar.config(text=f"Запчасть '{ep_data[2]}' — {mark}")
 
     def _catalog_inline_remove_part(self):
         sel = self._catalog_selected_equip()
@@ -1987,21 +1971,6 @@ class GRPAppPG:
 
         tk.Label(info_frame, text=formula_text, justify=tk.LEFT, font=("Arial", 9), fg="#495057").pack(fill=tk.X)
 
-    def setup_stats_tab(self):
-        # Экран статистики убран из интерфейса (таб и пункт меню).
-        # Разметка и show_statistics() оставлены на случай возврата.
-        select_frame = tk.Frame(self.stats_tab)
-        select_frame.pack(pady=10)
-
-        tk.Label(select_frame, text="Текущий ГРП:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
-        self.stats_grp_label = tk.Label(select_frame, text="—", font=("Arial", 10, "bold"), fg="#546E7A")
-        self.stats_grp_label.pack(side=tk.LEFT, padx=8)
-
-        self._btn(select_frame, "🔍 Проверить оборудование", self.check_equipment_stats, color='info', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-
-        self.stats_text = scrolledtext.ScrolledText(self.stats_tab, wrap=tk.WORD, height=20, font=("Courier", 10))
-        self.stats_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
     def add_grp(self):
         window = Toplevel(self.root)
         window.title("Добавить ГРП")
@@ -2264,7 +2233,8 @@ class GRPAppPG:
 
         try:
             saved = word_report_pg.generate_grp_docx(
-                self.db, self.doc_analyzer, grp_id, grp_name, filename)
+                self.db, self.doc_analyzer, grp_id, grp_name, filename,
+                params=self.calc_params)
             messagebox.showinfo("Успех", f"Отчёт по ГРП «{grp_name}» сохранён:\n{saved}")
             self.statusbar.config(text=f"Word-отчёт по ГРП {grp_name} сохранён")
         except Exception as e:
@@ -2548,186 +2518,6 @@ class GRPAppPG:
 
         self.statusbar.config(text=f"Загружена история для ГРП #{grp_id}: {len(coefficients)} записей")
 
-    def show_statistics(self):
-        grp = self._current_grp()
-        if grp is None:
-            return
-
-        grp_id = grp[0]
-        grp_name = grp[1]
-        self.stats_grp_label.config(text=grp_name)
-        equipment_data = self.db.get_equipment_by_grp(grp_id)
-
-        self.stats_text.config(state=tk.NORMAL)
-        self.stats_text.delete(1.0, tk.END)
-
-        if not equipment_data:
-            self.stats_text.insert(tk.END, "❌ Нет данных об оборудовании")
-            return
-
-        analyzer = StatisticsAnalyzer(
-            self._to_equipment_list(equipment_data),
-            norm_resolver=self._parts_aware_norm
-        )
-        stats = analyzer.calculate_statistics()
-
-        self.stats_text.insert(tk.END, "=" * 70 + "\n")
-        self.stats_text.insert(tk.END, "📊 ОБЩАЯ СТАТИСТИКА ПО ВСЕМУ ОБОРУДОВАНИЮ\n")
-        self.stats_text.insert(tk.END, "=" * 70 + "\n\n")
-
-        if stats['count'] == 0:
-            self.stats_text.insert(tk.END, "❌ Нет данных для анализа!\n")
-            return
-
-        self.stats_text.insert(tk.END, f"📊 Количество образцов: {stats['count']} шт.\n")
-        self.stats_text.insert(tk.END, f"📈 СРЕДНЕЕ время жизни: {stats['mean']:.1f} мес. ({years_to_text(stats['mean']/12)})\n")
-        self.stats_text.insert(tk.END, f"📉 МЕДИАНА время жизни: {stats['median']:.1f} мес. ({years_to_text(stats['median']/12)})\n")
-        self.stats_text.insert(tk.END, f"📏 Стандартное отклонение: {stats['std']:.1f} мес.\n")
-        self.stats_text.insert(tk.END, f"🔽 Минимальное: {stats['min']:.1f} мес. ({years_to_text(stats['min']/12)})\n")
-        self.stats_text.insert(tk.END, f"🔼 Максимальное: {stats['max']:.1f} мес. ({years_to_text(stats['max']/12)})\n")
-
-        self.statusbar.config(text=f"Статистика для ГРП #{grp_id} загружена")
-
-    def check_equipment_stats(self):
-        grp = self._current_grp()
-        if grp is None:
-            return
-
-        grp_id = grp[0]
-        equipment_data = self.db.get_equipment_by_grp(grp_id)
-
-        if not equipment_data:
-            messagebox.showinfo("Информация", "Нет данных об оборудовании")
-            return
-
-        select_window = Toplevel(self.root)
-        select_window.title("Выбор оборудования для анализа")
-        select_window.transient(self.root)
-        select_window.grab_set()
-
-        tk.Label(select_window, text="🔍 Выберите оборудование:", font=("Arial", 12, "bold")).pack(pady=10)
-
-        unique_names = sorted(set(e[1] for e in equipment_data))
-
-        list_frame = tk.Frame(select_window)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        listbox = tk.Listbox(list_frame, height=15, font=("Arial", 10), yscrollcommand=scrollbar.set)
-        for name in unique_names:
-            count = sum(1 for e in equipment_data if e[1] == name)
-            listbox.insert(tk.END, f"{name}  ({count} шт.)")
-        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=listbox.yview)
-
-        def analyze_selected():
-            selected = listbox.curselection()
-            if not selected:
-                messagebox.showwarning("Внимание", "Выберите оборудование!")
-                return
-
-            equip_name = listbox.get(selected[0]).split("  (")[0]
-            select_window.destroy()
-
-            filtered_equipment = [
-                equip for equip in self._to_equipment_list(equipment_data)
-                if equip.name == equip_name
-            ]
-
-            analyzer = StatisticsAnalyzer(
-                filtered_equipment,
-                norm_resolver=self._parts_aware_norm
-            )
-            stats = analyzer.calculate_statistics()
-            norm = analyzer.get_norm_for_equipment(filtered_equipment[0])
-
-            result_window = Toplevel(self.root)
-            result_window.title(f"Статистика: {equip_name}")
-            result_window.transient(self.root)
-
-            text_area = scrolledtext.ScrolledText(result_window, wrap=tk.WORD, font=("Courier", 10))
-            text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-            text_area.insert(tk.END, "=" * 80 + "\n")
-            text_area.insert(tk.END, f"📊 СТАТИСТИКА ОБОРУДОВАНИЯ: {equip_name}\n")
-            text_area.insert(tk.END, "=" * 80 + "\n\n")
-
-            text_area.insert(tk.END, f"📊 Количество образцов: {stats['count']} шт.\n")
-            text_area.insert(tk.END, f"📈 СРЕДНЕЕ время жизни: {stats['mean']:.1f} мес. ({years_to_text(stats['mean']/12)})\n")
-            text_area.insert(tk.END, f"📉 МЕДИАНА время жизни: {stats['median']:.1f} мес. ({years_to_text(stats['median']/12)})\n")
-            text_area.insert(tk.END, f"📏 Стандартное отклонение: {stats['std']:.1f} мес.\n")
-            text_area.insert(tk.END, f"🔽 Минимальное: {stats['min']:.1f} мес. ({years_to_text(stats['min']/12)})\n")
-            text_area.insert(tk.END, f"🔼 Максимальное: {stats['max']:.1f} мес. ({years_to_text(stats['max']/12)})\n\n")
-
-            if norm is None:
-                text_area.insert(tk.END, "❓ Для оборудования нет документальной нормы!\n\n")
-
-            text_area.insert(tk.END, "=" * 80 + "\n")
-            text_area.insert(tk.END, "📋 ПОДРОБНЫЙ СПИСОК ВСЕХ ЭКЗЕМПЛЯРОВ:\n")
-            text_area.insert(tk.END, "=" * 80 + "\n\n")
-
-            for i, equip in enumerate(filtered_equipment, 1):
-                lifetime = equip.lifetime_months
-                if lifetime:
-                    lifetime_years = lifetime / 12
-                    install_year = equip.install_date[:4] if equip.install_date else "?"
-                    removal_info = equip.removal_date[:4] if equip.removal_date else "в эксплуатации"
-
-                    if norm:
-                        if lifetime_years > norm:
-                            status = "❌ ПРЕВЫШЕНИЕ"
-                        elif lifetime_years >= norm - 1:
-                            status = "⚠️ СКОРО ЗАМЕНА"
-                        else:
-                            status = "✅ НОРМА"
-                    else:
-                        status = "❓ НЕТ НОРМЫ"
-
-                    text_area.insert(tk.END, f"{i:2d}. {equip.name}\n")
-                    text_area.insert(tk.END, f"     📅 Установка: {equip.install_date} → {removal_info}\n")
-                    text_area.insert(tk.END, f"     ⏱ Время жизни: {lifetime:.1f} мес. ({years_to_text(lifetime_years)})  {status}\n\n")
-
-            if norm:
-                text_area.insert(tk.END, f"\n📋 Документальная норма: {years_to_text(norm)}\n")
-                if stats['mean'] / 12 > norm:
-                    text_area.insert(tk.END, "⚠️ СРЕДНЕЕ время жизни ПРЕВЫШАЕТ норму!\n")
-                elif stats['median'] / 12 > norm:
-                    text_area.insert(tk.END, "⚠️ МЕДИАННОЕ время жизни ПРЕВЫШАЕТ норму!\n")
-                else:
-                    text_area.insert(tk.END, "✅ Среднее и медианное время жизни в пределах нормы\n")
-
-                exceeded_count = sum(1 for e in filtered_equipment
-                                     if e.lifetime_months and (e.lifetime_months / 12) > norm)
-                text_area.insert(tk.END, f"\n📊 Из {stats['count']} экземпляров:\n")
-                text_area.insert(tk.END, f"   • Превысили норму: {exceeded_count} шт.\n")
-                text_area.insert(tk.END, f"   • В пределах нормы: {stats['count'] - exceeded_count} шт.\n")
-
-            text_area.config(state=tk.DISABLED)
-
-            btn_frame = tk.Frame(result_window)
-            btn_frame.pack(pady=10)
-
-            def export_stats():
-                filename = filedialog.asksaveasfilename(
-                    defaultextension=".txt",
-                    filetypes=[("Text files", "*.txt")],
-                    initialfile=f"stats_{equip_name}_{datetime.now().strftime('%Y%m%d')}.txt"
-                )
-                if filename:
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write(text_area.get(1.0, tk.END))
-                    messagebox.showinfo("Успех", f"Сохранено в:\n{filename}")
-
-            self._btn(btn_frame, "💾 Сохранить отчет", export_stats, color='success', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-            self._btn(btn_frame, "✖ Закрыть", result_window.destroy, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=5)
-            fit_window(result_window, min_width=820, min_height=560)
-
-        self._btn(select_window, "🔍 Анализировать выбранное", analyze_selected, color='info', font_size=10, padx=15).pack(pady=10)
-        self._btn(select_window, "❌ Отмена", select_window.destroy, color='danger', font_size=10, padx=20).pack(pady=5)
-        fit_window(select_window, min_width=460, min_height=520)
-
     def update_catalog_combo(self):
         """Обновление списка ГРП-каталогов в разделе «Каталог оборудования»."""
         grps = self.db.get_all_grp()
@@ -2759,9 +2549,19 @@ class GRPAppPG:
             return
 
         try:
-            AlgorithmsWindow(self.root, self.db, grp_id, equipment_data, grp_name)
+            self._algorithms_window = AlgorithmsWindow(
+                self.root, self.db, grp_id, equipment_data, grp_name,
+                params=self.calc_params, on_params=self._remember_calc_params)
             self.statusbar.config(text=f"Открыт расчёт алгоритмов для ГРП: {grp_name}")
         except ImportError as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить модуль algorithms_view: {e}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Ошибка при открытии окна алгоритмов: {e}")
+
+    def _remember_calc_params(self, params: AlgorithmParams):
+        """Запомнить весовые коэффициенты, заданные в окне расчёта.
+
+        Отчёт Word формируется с ними, иначе пользователь увидит в .docx
+        числа, отличающиеся от только что посчитанных на экране.
+        """
+        self.calc_params = params

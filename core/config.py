@@ -5,11 +5,63 @@
 иначе используются значения по умолчанию.
 """
 import os
+import sys
+
+
+def _app_dir() -> str:
+    """Папка приложения: рабочая папка программы.
+
+    При сборке PyInstaller (one-file) код распакован во временную папку
+    `sys._MEIPASS`, писать туда нельзя — рабочие файлы (Замены.xlsx)
+    должны лежать рядом с .exe.
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resource_dir() -> str:
+    """Папка ресурсов приложения (только чтение).
+
+    При сборке PyInstaller ресурсы (icon.ico, docs/) лежат в `sys._MEIPASS`,
+    иначе — рядом с кодом.
+    """
+    if getattr(sys, 'frozen', False):
+        return getattr(sys, '_MEIPASS', _app_dir())
+    return _app_dir()
+
 
 # Корень проекта — папка, в которой лежат пакеты core/db/logic/integration/ui
 # и точки входа main_pg.py, seed.py. От неё отсчитываются пути к рабочим
 # файлам (Замены.xlsx), чтобы перенос модуля по папкам их не ломал.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = _app_dir()
+
+# Папка ресурсов: при сборке .exe отличается от PROJECT_ROOT (см. _resource_dir).
+RESOURCE_DIR = _resource_dir()
+
+
+def resource_path(*parts: str) -> str:
+    """Путь к файлу ресурса (icon.ico, docs/…) — с учётом сборки .exe."""
+    return os.path.join(RESOURCE_DIR, *parts)
+
+
+def docs_path(*parts: str) -> str:
+    """Путь к файлу из docs/, ищем и в ресурсах, и рядом с программой.
+
+    Папка docs/ не входит в one-file сборку, поэтому при её отсутствии
+    в _MEIPASS проверяем рабочую папку приложения.
+
+    Если файла нет ни там, ни там, возвращается путь рядом с программой:
+    он попадает в сообщение об ошибке, и пользователю видно, куда
+    положить методику (а не временную папку PyInstaller, которой
+    через минуту уже не будет).
+    """
+    candidates = [os.path.join(RESOURCE_DIR, 'docs', *parts),
+                  os.path.join(PROJECT_ROOT, 'docs', *parts)]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[-1]
 
 DB_CONFIG = {
     'host': os.getenv('GRP_DB_HOST', 'localhost'),

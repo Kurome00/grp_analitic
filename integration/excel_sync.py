@@ -37,7 +37,7 @@ HEADER_FILL = PatternFill("solid", fgColor="DDEBF7")
 
 
 def default_filename() -> str:
-    """Путь к файлу «Замены.xlsx» в корне проекта."""
+    """Путь к файлу «Замены.xlsx» рядом с программой."""
     return os.path.join(PROJECT_ROOT, "Замены.xlsx")
 
 

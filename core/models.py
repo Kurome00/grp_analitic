@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 from typing import Optional
-from datetime import datetime, date
+
+from core.lifetimes import lifetime_months
 
 
 @dataclass
 class Equipment:
     """Модель оборудования"""
+
     name: str
     install_date: str
     removal_date: Optional[str] = None
@@ -13,28 +15,17 @@ class Equipment:
 
     @property
     def lifetime_months(self) -> Optional[float]:
-        """Вычисление времени жизни в месяцах"""
-        try:
-            if isinstance(self.install_date, date):
-                install = self.install_date
-            else:
-                install = datetime.strptime(self.install_date, '%Y-%m-%d').date()
+        """Время жизни в месяцах (до снятия или до сегодняшнего дня).
 
-            if self.removal_date:
-                if isinstance(self.removal_date, date):
-                    removal = self.removal_date
-                else:
-                    removal = datetime.strptime(self.removal_date, '%Y-%m-%d').date()
-            else:
-                removal = date.today()
-
-            return (removal - install).days / 30.44
-        except Exception:
-            return None
+        Считает core.lifetimes: тот же делитель, что и во всех остальных
+        местах приложения.
+        """
+        return lifetime_months(self.install_date, self.removal_date)
 
 
 @dataclass
 class Part:
     """Модель типа запчасти (справочник)"""
+
     name: str
     norm_years: float

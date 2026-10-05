@@ -1,7 +1,16 @@
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
+from core.lifetimes import (
+    add_years,
+    age_years,
+    driving_parts_remaining,
+    lifetime_months,
+    parse_date,
+    remaining_years,
+    years_between,
+)
 from core.models import Equipment
 from core.timefmt import years_to_text
 
@@ -12,36 +21,11 @@ class DocumentaryAnalyzer:
     def __init__(self, norms_db):
         self.norms_db = norms_db
 
-    @staticmethod
-    def _parse_date(value) -> Optional[date]:
-        try:
-            if isinstance(value, date):
-                return value
-            if isinstance(value, datetime):
-                return value.date()
-            return datetime.strptime(value, '%Y-%m-%d').date()
-        except Exception:
-            return None
+    _parse_date = staticmethod(parse_date)
 
     def get_equipment_age_years(self, install_date_str: str, removal_date_str: Optional[str] = None) -> float:
-        """Рассчитывает возраст оборудования в годах"""
-        try:
-            if isinstance(install_date_str, date):
-                install_date = install_date_str
-            else:
-                install_date = datetime.strptime(install_date_str, '%Y-%m-%d').date()
-
-            if removal_date_str:
-                if isinstance(removal_date_str, date):
-                    end_date = removal_date_str
-                else:
-                    end_date = datetime.strptime(removal_date_str, '%Y-%m-%d').date()
-            else:
-                end_date = date.today()
-
-            return (end_date - install_date).days / 365.25
-        except Exception:
-            return 0.0
+        """Возраст оборудования в годах (до снятия или до сегодняшнего дня)"""
+        return age_years(install_date_str, removal_date_str)
 
     def get_norm_for_equipment(self, equipment_name: str,
                                equipment_id: Optional[int] = None,
@@ -95,16 +79,13 @@ class DocumentaryAnalyzer:
         for _ep_id, _part_id, _pname, pnorm, p_install, p_removal, _pnumb, is_repl in parts:
             if p_removal or not is_repl:
                 continue
-            part_start = self._parse_date(p_install) or equip_install
-            try:
-                norm_years = float(pnorm)
-            except (TypeError, ValueError):
-                continue
-            expiries.append(part_start + timedelta(days=norm_years * 365.25))
+            expiry = add_years(self._parse_date(p_install) or equip_install, pnorm)
+            if expiry is not None:
+                expiries.append(expiry)
 
         if not expiries:
             return None
-        return (min(expiries) - equip_install).days / 365.25
+        return years_between(min(expiries), equip_install)
 
     def get_remaining_life(self, equipment_id: int, install_date: str) -> Optional[float]:
         """Оставшийся срок службы оборудования, лет.
@@ -118,23 +99,8 @@ class DocumentaryAnalyzer:
         if not parts:
             return None
 
-        equip_install = self._parse_date(install_date)
-        remaining = []
-        for _ep, _pid, _pname, pnorm, p_install, p_removal, _pnumb, is_repl in parts:
-            if p_removal or not is_repl:
-                continue
-            part_start = self._parse_date(p_install) or equip_install
-            if part_start is None:
-                continue
-            try:
-                norm_years = float(pnorm)
-            except (TypeError, ValueError):
-                continue
-            expiry = part_start + timedelta(days=norm_years * 365.25)
-            remaining.append((expiry - date.today()).days / 365.25)
-        if not remaining:
-            return None
-        return min(remaining)
+        remaining = driving_parts_remaining(parts)
+        return min(remaining) if remaining else None
 
     def get_parts_status(self, equipment_id: int, install_date: str) -> List[Dict]:
         """Статус каждой заменяемой запчасти оборудования: имя, норма, дата
@@ -152,17 +118,15 @@ class DocumentaryAnalyzer:
             if not is_repl:
                 continue
             part_start = self._parse_date(p_install) or equip_install
-            try:
-                norm_years = float(pnorm)
-            except (TypeError, ValueError):
+            expiry = add_years(part_start, pnorm)
+            if expiry is None:
                 continue
-            expiry = part_start + timedelta(days=norm_years * 365.25)
             status_list.append({
                 'name': pname,
-                'norm_years': norm_years,
+                'norm_years': float(pnorm),
                 'install_date': part_start.isoformat(),
                 'expiry_date': expiry.isoformat(),
-                'remaining': (expiry - date.today()).days / 365.25,
+                'remaining': remaining_years(part_start, pnorm) or 0.0,
                 'removed': bool(p_removal),
             })
         return sorted(status_list, key=lambda s: (s['expiry_date'] if not s['removed'] else '9999'))

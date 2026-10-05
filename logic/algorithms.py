@@ -17,10 +17,16 @@
 """
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
-from core.config import EQUIPMENT_NORMS, FULL_CHECK_TERM
+from core.config import FULL_CHECK_TERM
+from core.lifetimes import (
+    age_years,
+    default_norm,
+    norm_for_name,
+    parse_date,
+)
 from core.timefmt import years_to_text
 
 
@@ -329,6 +335,15 @@ class AlgorithmResult:
 # два срока раздельно: по скорректированной методике (3) и по календарной (4).
 DEADLINE_ALGORITHMS: Tuple[int, ...] = (3, 4)
 
+# Методики с полным набором поправок Z = Z_база · K_сост · K_эксл · K_рем · k_повр.
+# Методика 1 (среднее арифметическое) применяет только K_сост: по методике
+# остальные коэффициенты к элементу не входят, их учёт — в методиках 3-5.
+FULL_FACTOR_ALGORITHMS: Tuple[int, ...] = (2, 3, 4)
+
+# Методики, где итог по ГРП — минимум по критическим элементам (принцип слабого
+# звена). Методики 0 и 1 считают среднее арифметическое по всем элементам.
+WEAK_LINK_ALGORITHMS: Tuple[int, ...] = (2, 3, 4)
+
 # Слабым звеном считаем элементы, чей остаточный ресурс не превышает минимальный
 # более чем на это число лет: в пределах года разные элементы дают один и тот же
 # срок, и показывать надо их все, а не только первый попавшийся.
@@ -458,6 +473,11 @@ def algo_number(number: int) -> int:
     Внутри программы методики остаются с нуля: индексы нужны для обращения к
     calculate_algorithm_N и ключам словарей результатов. Пересчитывать всю
     нумерацию в коде незачем и опасно — достаточно сдвигать её на выходе.
+
+    ВАЖНО: любая строка с номером методики, которую видит пользователь
+    (интерфейс, Word-отчёт, трассировка), обязана строиться через
+    algo_number()/algo_label(). Номер, вписанный руками в текст, рано или
+    поздно разойдётся с той нумерацией, которую видит пользователь.
     """
     return number + 1
 
@@ -465,6 +485,32 @@ def algo_number(number: int) -> int:
 def algo_label(number: int) -> str:
     """Подпись методики для интерфейса и отчётов: «Алгоритм 3»."""
     return f'Алгоритм {number + 1}'
+
+
+# Исходный документ, из которого взята методика. Нумерация документов
+# разработчиков (1-4) не совпадает с нумерацией приложения (1-5): например,
+# методика приложения «Алгоритм 4» пришла из документа «Алгоритм
+# 3-без календаря». Чтобы отчёт не выглядел противоречивым, источник
+# указывается явно рядом с названием методики.
+ALGORITHM_SOURCES = {
+    0: '«Алгоритмы-(все до корректировки).pdf»',
+    1: '«Алгоритмы-(все до корректировки).pdf»',
+    2: '«Алгоритмы-(все до корректировки).pdf», «Алг3-схема данных.pdf»',
+    3: '«Алгоритм 3-без календаря-5+.pdf»',
+    4: '«Алгоритм 3-без календаря-5+.pdf», «Алгоритм4.pdf»',
+}
+
+
+def algo_source(number: int) -> str:
+    """Название исходного документа методики для пояснений и отчёта."""
+    return ALGORITHM_SOURCES.get(number, '—')
+
+
+# Основная методика расчёта: скорректированная редакция (внутренний индекс 3,
+# пользователю показывается как «Алгоритм 4»). Её результат — основа отчёта
+# и рекомендаций; календарная методика (индекс 4, «Алгоритм 5») даёт вторую
+# величину — срок до полной проверки оборудования.
+PRIMARY_ALGORITHM = 3
 
 
 ALGORITHM_TITLES = {
@@ -516,28 +562,11 @@ class GRPResourceCalculator:
 
     # -- служебное ----------------------------------------------------------
 
-    @staticmethod
-    def _parse_date(value) -> Optional[date]:
-        if isinstance(value, datetime):
-            return value.date()
-        if isinstance(value, date):
-            return value
-        if not value:
-            return None
-        for fmt in ('%Y-%m-%d', '%d.%m.%Y', '%Y-%m-%d %H:%M:%S'):
-            try:
-                return datetime.strptime(str(value)[:19].strip(), fmt).date()
-            except ValueError:
-                continue
-        return None
+    _parse_date = staticmethod(parse_date)
 
     def _age(self, start, end=None) -> float:
         """Возраст в годах."""
-        start_date = self._parse_date(start)
-        if start_date is None:
-            return 0.0
-        end_date = self._parse_date(end) or date.today()
-        return (end_date - start_date).days / 365.25
+        return age_years(start, end)
 
     @staticmethod
     def _to_iso(value) -> Optional[str]:
@@ -560,11 +589,11 @@ class GRPResourceCalculator:
             return explicit, 'задано вручную'
 
         name = element.get('name', '') or ''
-        for key, years in EQUIPMENT_NORMS.items():
-            if key in name or name in key:
-                return float(years), 'справочник config'
+        from_norms = norm_for_name(name)
+        if from_norms is not None:
+            return from_norms, 'справочник config'
 
-        return FULL_CHECK_TERM, f'срок полной проверки ({FULL_CHECK_TERM:g} лет)'
+        return default_norm(), f'срок полной проверки ({FULL_CHECK_TERM:g} лет)'
 
     def _active_details(self, element: Dict) -> List[Dict]:
         """Активные ЗАМЕНЯЕМЫЕ детали элемента (для базового ресурса).
@@ -916,8 +945,10 @@ class GRPResourceCalculator:
             ' × '.join(f'{num(value, 3)}' for _, value in factors) +
             f' = {num(element.z_element, 3)} ({years_to_text(element.z_element)})'
         )
-        element.z_element_note = ('полный набор поправок (Алгоритм 4/5)'
-                                  if full else 'только K_сост (Алгоритм 2)')
+        element.z_element_note = (
+            'полный набор поправок (' +
+            ', '.join(algo_label(n) for n in FULL_FACTOR_ALGORITHMS) + ')'
+            if full else f'только K_сост ({algo_label(2)})')
         if raw < 0:
             element.z_element_note += '; отрицательный ресурс ограничен нулем'
 
@@ -963,7 +994,7 @@ class GRPResourceCalculator:
     # -- общие блоки трассировки ------------------------------------------
 
     def _header(self, result: AlgorithmResult) -> None:
-        result.steps.append(Step('title', f'АЛГОРИТМ {result.algorithm_number}: '
+        result.steps.append(Step('title', f'{algo_label(result.algorithm_number).upper()}: '
                                           f'{result.algorithm_name}'))
         result.steps.append(Step('note', 'Исходные данные указаны в годах; '
                                          'результаты округлены для отображения.'))
@@ -1088,7 +1119,8 @@ class GRPResourceCalculator:
             algorithm_name=ALGORITHM_TITLES[number],
             algorithm_number=number,
             result=0.0,
-            steps=[Step('title', f'АЛГОРИТМ {number}: {ALGORITHM_TITLES[number]}'),
+            steps=[Step('title', f'{algo_label(number).upper()}: '
+                                 f'{ALGORITHM_TITLES[number]}'),
                    Step('warn', f'⚠ {reason}')],
             error=reason,
             recommendation=f'Расчёт не выполнен: {reason}',
@@ -1152,7 +1184,10 @@ class GRPResourceCalculator:
         self._header(result)
         result.steps.append(Step('note', 'По методике к элементу применяется только '
                                          'K_сост; остальные коэффициенты не используются, '
-                                         'их учёт — в Алгоритмах 2-4.'))
+                                         'их учёт — в ' +
+                                         ', '.join(algo_label(n)
+                                                   for n in FULL_FACTOR_ALGORITHMS)
+                                         + '.'))
         prepared, used = self._prepare(equipment_data, full_factors=False)
 
         if not used:
@@ -1334,8 +1369,8 @@ class GRPResourceCalculator:
         params = self.params
         result = AlgorithmResult(ALGORITHM_TITLES[4], 4, 0.0)
         self._header(result)
-        result.steps.append(Step('note', 'Шаги 6-14 совпадают со скорректированным '
-                                         'Алгоритмом 3: K_сост, K_эксл, K_рем, k_повр, '
+        result.steps.append(Step('note', f'Шаги 6-14 совпадают со скорректированным '
+                                         f'{algo_label(3)}: K_сост, K_эксл, K_рем, k_повр, '
                                          'учёт некратных замен и принцип слабого звена.'))
         result.steps.append(Step('note', 'База отличается: Z_база = Z_календ = '
                                          'S_нач − S_факт (срок полной проверки минус '

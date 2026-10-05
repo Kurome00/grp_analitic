@@ -11,7 +11,7 @@
 запчастей срока не имеет. Дополнительно выполняется расчёт остаточного
 ресурса по алгоритмам 0-4 (см. модуль algorithms).
 """
-from datetime import date, datetime
+from datetime import datetime
 
 from docx import Document
 from docx.enum.section import WD_ORIENT, WD_SECTION
@@ -22,6 +22,7 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
 from core.config import FULL_CHECK_TERM, REPLACEABLE_NORM_YEARS
+from core.lifetimes import years_between
 from core.models import Equipment
 from core.timefmt import years_to_text
 from logic.algorithms import (
@@ -29,9 +30,12 @@ from logic.algorithms import (
     DEADLINE_ALGORITHMS,
     FAILURE_MARKERS,
     POOR_REPAIR_MARKERS,
+    PRIMARY_ALGORITHM,
+    ALGORITHM_SOURCES,
     AlgorithmParams,
-    GRPResourceCalculator,
     algo_label,
+    algo_number,
+    algo_source,
     build_deadlines,
     calculate_all_algorithms,
     critical_title,
@@ -244,10 +248,10 @@ def _formula(doc, text):
                  size=BODY_SIZE, space_after=6)
 
 
-def _note(doc, text, color=GREY):
+def _note(doc, text, color=GREY, space_after=6):
     """Примечание меньшим кеглем."""
     return _body(doc, text, color=color, size=11, indent=False, italic=True,
-                 space_after=6)
+                 space_after=space_after)
 
 
 def _bullet(doc, text, color=INK, bold=False):
@@ -508,10 +512,7 @@ def _effect_text(effect, equipment_name='', part_name=''):
 
 def _age_years(value):
     """Возраст оборудования в годах от даты установки."""
-    parsed = GRPResourceCalculator._parse_date(value)
-    if not parsed:
-        return None
-    return (date.today() - parsed).days / 365.25
+    return years_between(value)
 
 
 def _match_journal(name, journal):
@@ -599,8 +600,16 @@ def _coefficients(db, grp_id):
 # ---------------------------------------------------------------------------
 
 def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
-                      filename: str = None) -> str:
+                      filename: str = None, params: AlgorithmParams = None,
+                      coefficients: dict = None) -> str:
     """Сформировать официальный Word-отчёт по конкретному ГРП.
+
+    params — весовые коэффициенты алгоритмов. Если не переданы, берутся
+    рекомендуемые значения методики (AlgorithmParams по умолчанию).
+    Вызывающий код обязан передавать те же параметры, что и в окно расчётов,
+    иначе отчёт разойдётся с тем, что пользователь видел на экране.
+
+    coefficients — техкоэффициенты A/B/C/K; по умолчанию читаются из БД.
 
     Возвращает путь к сохранённому файлу .docx.
     """
@@ -622,11 +631,13 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
         replacements = db.get_replacements_by_grp(grp_id) or []
 
     journal = _load_journal(db, grp_id)
-    coefficients = _coefficients(db, grp_id)
-    params = AlgorithmParams()
+    if coefficients is None:
+        coefficients = _coefficients(db, grp_id)
+    if params is None:
+        params = AlgorithmParams()
     results = calculate_all_algorithms(_calc_inputs(db, grp_id, equipment_rows, journal),
                                        params=params, coefficients=coefficients)
-    primary = results[3]
+    primary = results[PRIMARY_ALGORITHM]
     usable = [r for r in results.values() if not r.error]
     # Два срока — по методикам 3 и 4 — плюс слабые звенья каждого.
     deadlines = build_deadlines(results)
@@ -672,12 +683,21 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
 
     # --- 2. Методика -------------------------------------------------------
     _section_title(doc, '2 МЕТОДИКА РАСЧЁТА')
-    _body(doc, 'Расчёт выполнен по скорректированной редакции методики оценки '
-               'остаточного ресурса элементов ГРП. Оценка производится в два этапа: '
+    _body(doc, f'Расчёт выполнен по {algo_label(PRIMARY_ALGORITHM)} — скорректированной '
+               'редакции методики оценки остаточного ресурса элементов ГРП. '
+               'Оценка производится в два этапа: '
                'определяется базовый ресурс элемента, затем применяются '
                'поправочные коэффициенты. Итог по ГРП определяется по принципу '
-               'слабого звена — минимальному ресурсу среди критических элементов.',
-          space_after=8)
+               'слабого звена — минимальному ресурсу среди критических элементов. '
+               'Для сравнения в разделе 3 приведён также результат '
+               f'{algo_label(DEADLINE_ALGORITHMS[1])} — он считает другую величину '
+               '(срок до полной проверки оборудования), поэтому сводить их в одно '
+               'значение нельзя.',
+           space_after=4)
+    _note(doc, 'Нумерация методик в приложении (1-5) не совпадает с нумерацией '
+               'исходных документов. Соответствие: ' + '; '.join(
+                   f'{algo_label(n)} — {algo_source(n)}' for n in sorted(ALGORITHM_SOURCES)
+               ) + '.', space_after=8)
 
     doc.add_heading('2.1 Базовый ресурс элемента', level=2)
     _body(doc, 'Базовый ресурс определяется каскадом оценок; применяется первый '
@@ -712,8 +732,12 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
                  aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
                          WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
                  size=10)
-    _note(doc, 'Значения приведены по рекомендациям методики и подлежат уточнению '
-               'по результатам эксплуатации конкретного объекта.')
+    if params is not None and params != AlgorithmParams():
+        _note(doc, 'Применены весовые коэффициенты, заданные в окне расчёта; '
+                   'они отличаются от рекомендуемых методикой значений по умолчанию.')
+    else:
+        _note(doc, 'Значения приведены по рекомендациям методики и подлежат уточнению '
+                   'по результатам эксплуатации конкретного объекта.')
     _body(doc, '', indent=False, space_after=6)
 
     # --- 3. Результаты расчёта --------------------------------------------
@@ -814,8 +838,9 @@ def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
                          size=9)
             _body(doc, '', indent=False, space_after=6)
             if dl.recommendation:
-                _body(doc, f'Рекомендация по методике {dl.algorithm_number}: '
-                           f'{dl.recommendation}', size=12, space_after=8)
+                _body(doc, f'Рекомендация по методике '
+                            f'{algo_number(dl.algorithm_number)}: '
+                            f'{dl.recommendation}', size=12, space_after=8)
 
     # --- 4. Поэлементный расчёт -------------------------------------------
     _section_title(doc, '4 ПОЭЛЕМЕНТНЫЙ РАСЧЁТ')

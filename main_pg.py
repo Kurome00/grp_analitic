@@ -1,9 +1,8 @@
 import os
-import sys
 import tkinter as tk
 from tkinter import messagebox
 
-from core.config import DB_CONFIG
+from core.config import DB_CONFIG, resource_path
 from ui.views_pg import GRPAppPG
 
 
@@ -23,18 +22,9 @@ DB_HELP = (
 )
 
 
-def _resource_dir():
-    """Папка ресурсов: папка скрипта или _MEIPASS при сборке PyInstaller."""
-    if getattr(sys, "frozen", False):
-        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
-
-
 def _set_app_icon(root: tk.Tk):
-    """Иконка окна: icon.ico (приоритет) или icon.png из папки приложения."""
-    base = _resource_dir()
-
-    ico = os.path.join(base, "icon.ico")
+    """Иконка окна: icon.ico (приоритет) или icon.png из папки ресурсов."""
+    ico = resource_path("icon.ico")
     if os.path.isfile(ico):
         try:
             root.iconbitmap(ico)
@@ -42,7 +32,7 @@ def _set_app_icon(root: tk.Tk):
         except tk.TclError:
             pass
 
-    png = os.path.join(base, "icon.png")
+    png = resource_path("icon.png")
     if os.path.isfile(png):
         try:
             img = tk.PhotoImage(file=png)

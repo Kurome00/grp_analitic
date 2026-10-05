@@ -12,16 +12,48 @@ from tkinter import messagebox, ttk
 from core.config import FULL_CHECK_TERM
 from core.timefmt import years_to_text
 from ui.window_utils import fit_window
+from ui.widgets_calc import (
+    ACCENT,
+    BAD,
+    BG,
+    CARD,
+    F_BODY,
+    F_HERO,
+    F_TABLE_B,
+    GOOD,
+    LINE,
+    SUB,
+    TEXT,
+    TINT_BAD,
+    TINT_GOOD,
+    TINT_PART,
+    TINT_SKIP,
+    TINT_WARN,
+    WARN,
+    Pane,
+    calc_theme,
+    card,
+    card_title,
+    fit_table,
+    head_row,
+    note,
+    restore_theme,
+    table,
+)
 from logic.algorithms import (
+    ALGORITHM_SHORT,
     ALGORITHM_TITLES,
     DAMAGE_MARKERS,
+    DEADLINE_ALGORITHMS,
     FAILURE_MARKERS,
     GRPResourceCalculator,
     POOR_REPAIR_MARKERS,
+    PRIMARY_ALGORITHM,
+    WEAK_LINK_ALGORITHMS,
     WEAK_LINK_TOLERANCE,
     AlgorithmParams,
     algo_label,
-    algo_number,
+    algo_source,
     calculate_all_algorithms,
     classify_critical,
     critical_short_title,
@@ -31,17 +63,13 @@ from logic.algorithms import (
     signed_years,
 )
 
-BG = '#f4f6f9'
-CARD = '#ffffff'
-LINE = '#e3e8ef'
-TEXT = '#1f2933'
-MUTED = '#6b7785'
-ACCENT = '#2f6fed'
-GOOD = '#1e9e63'
-WARN = '#e8a317'
-BAD = '#d64545'
+MUTED = SUB
 
-PRIMARY_ALGORITHM = 3
+# Ширина ленты методик. Плитка должна вмещать «Алгоритм N», короткое имя и
+# остаток в одну строку каждое, иначе лента растёт в высоту и методики
+# начинают уезжать за нижний край окна.
+RAIL_W = 244
+
 # Предел горизонта на ползунке «Срок замены»: пять лет — норма заменяемых
 # деталей, дальше смотреть бессмысленно, там всё равно всё просрочено.
 HORIZON_MAX = 5.0
@@ -49,31 +77,32 @@ HORIZON_MAX = 5.0
 # («2 года 5 мес»), а не «2 года 5 мес 2 дн» из-за дробного шага мыши.
 HORIZON_SNAP = 1.0 / 12.0
 CONSERVATIVE_NOTE = (
-    'Сроки по методикам 3 и 4 показываются раздельно: сводить их в одну величину '
+    f'Сроки по {algo_label(DEADLINE_ALGORITHMS[0])} и {algo_label(DEADLINE_ALGORITHMS[1])} '
+    'показываются раздельно: сводить их в одну величину '
     'нельзя — они считают разные величины (по заменяемым деталям и по '
     'календарному сроку оборудования), поэтому расхождение между ними ожидаемо.'
 )
 
 TRACE_COLORS = {
     'title': (ACCENT, True, False),
-    'formula': ('#0b3d91', True, False),
+    'formula': ('#123a8f', True, False),
     'value': (TEXT, False, False),
-    'note': (MUTED, False, True),
+    'note': (SUB, False, True),
     'warn': (BAD, True, False),
 }
 
 
-def _btn(parent, text, command, color=ACCENT, font_size=10, padx=12):
+def _btn(parent, text, command, color=ACCENT, font_size=10, padx=14):
     """Плоская кнопка с подсветкой при наведении."""
     palette = {
-        'success': ('#1e9e63', '#17905a'),
-        'danger': ('#d64545', '#bd3a3a'),
-        'muted': ('#8b95a1', '#78828e'),
+        'success': (GOOD, _darken(GOOD)),
+        'danger': (BAD, _darken(BAD)),
+        'muted': (SUB, _darken(SUB)),
     }
     bg, bg_hover = palette.get(color, (color, _darken(color)))
     btn = tk.Button(
         parent, text=text, command=command, bg=bg, fg='#ffffff',
-        font=('Segoe UI', font_size), padx=padx, pady=5,
+        font=('Segoe UI', font_size), padx=padx, pady=6,
         bd=0, relief='flat', cursor='hand2', activebackground=bg_hover,
         activeforeground='#ffffff', highlightthickness=0,
     )
@@ -91,43 +120,15 @@ def _darken(hex_color, factor=0.85):
     return '#%02x%02x%02x' % (int(r * factor), int(g * factor), int(b * factor))
 
 
-def _card(parent, **pack):
-    """Белая карточка со скруглённой рамкой."""
-    frame = tk.Frame(parent, bg=CARD, highlightbackground=LINE,
-                     highlightthickness=1, bd=0)
-    frame.pack(**pack)
-    return frame
-
-
-def _tree(parent, columns, widths, height=10, style=None, wide_first=False):
-    """Дерево таблицы с вертикальным скроллбаром.
-
-    wide_first растягивает только первую графу: числовые колонки остаются
-    заданной ширины и не сплющиваются, когда ширины не хватает.
-    """
-    holder = tk.Frame(parent, bg=BG)
-    holder.pack(fill=tk.BOTH, expand=True)
-
-    tree = ttk.Treeview(holder, columns=columns, show='headings',
-                        height=height, selectmode='browse', style=style)
-    for index, column in enumerate(columns):
-        tree.heading(column, text=column)
-        tree.column(column, width=widths.get(column, 110), anchor=tk.W,
-                    stretch=wide_first or index == 0)
-    scrollbar = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=tree.yview)
-    tree.configure(yscrollcommand=scrollbar.set)
-    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    return tree
-
-
-def _text_block(parent, height=12, font=('Consolas', 10)):
+def _text_block(parent, height=12, font=F_BODY, bg=CARD):
     """Прокручиваемый текстовый блок с тегами подсветки."""
-    holder = tk.Frame(parent, bg=BG)
+    holder = tk.Frame(parent, bg=bg)
     holder.pack(fill=tk.BOTH, expand=True)
     box = tk.Text(holder, wrap=tk.WORD, font=font, height=height, bd=0,
-                  highlightthickness=0, bg='#fbfcfd', fg=TEXT, padx=10, pady=8)
-    scrollbar = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=box.yview)
+                  highlightthickness=0, bg=bg, fg=TEXT, padx=16, pady=12,
+                  spacing1=0, spacing3=4)
+    scrollbar = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=box.yview,
+                              style='Calc.Vertical.TScrollbar')
     box.configure(yscrollcommand=scrollbar.set)
     box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -217,21 +218,8 @@ def _last_replacement_on(journal):
 
 def _tree_hier(parent, columns, widths, height=8):
     """Дерево с раскрываемыми строками: оборудование → его детали."""
-    holder = tk.Frame(parent, bg=BG)
-    holder.pack(fill=tk.BOTH, expand=True)
-
-    tree = ttk.Treeview(holder, columns=columns, show='tree headings',
-                        height=height, selectmode='browse')
-    tree.heading('#0', text='Оборудование / деталь')
-    tree.column('#0', width=280, anchor=tk.W, stretch=False)
-    for column in columns:
-        tree.heading(column, text=column)
-        tree.column(column, width=widths.get(column, 110), anchor=tk.W)
-    scrollbar = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=tree.yview)
-    tree.configure(yscrollcommand=scrollbar.set)
-    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    return tree
+    return table(parent, columns, widths, height=height, expand=False,
+                 tree=True, tree_width=300)
 
 
 def _is_counted_part(detail):
@@ -434,7 +422,7 @@ class HorizonSlider(tk.Frame):
         handle_x = self._x_from_value(self._value)
 
         # Дорожка: серая «рельса» + заливка пройденного.
-        canvas.create_line(left, track_y, right, track_y, fill='#dfe4ea',
+        canvas.create_line(left, track_y, right, track_y, fill='#dde3ec',
                            width=self.TRACK_H, capstyle=tk.ROUND)
         canvas.create_line(left, track_y, handle_x, track_y, fill=color,
                            width=self.TRACK_H, capstyle=tk.ROUND)
@@ -446,11 +434,11 @@ class HorizonSlider(tk.Frame):
             if month % 12 == 0:
                 canvas.create_line(x, track_y + self.TRACK_H / 2 + 3,
                                    x, track_y + self.TRACK_H / 2 + 3 + self.TICK_H,
-                                   fill='#aeb8c4', width=2)
+                                   fill='#8e99a8', width=2)
                 label = _horizon_text(float(month // 12))
                 canvas.create_text(x, track_y + self.TRACK_H / 2 + 3 + self.TICK_H
                                    + self.LABEL_H / 2 + 1, text=label,
-                                   fill=MUTED, font=('Segoe UI', 8))
+                                   fill=SUB, font=('Segoe UI', 9))
             elif month % 3 == 0:
                 canvas.create_line(x, track_y + self.TRACK_H / 2 + 4,
                                    x, track_y + self.TRACK_H / 2 + 3 + self.TICK_H - 1,
@@ -472,22 +460,33 @@ class HorizonSlider(tk.Frame):
 class AlgorithmsWindow:
     """Расчёт и разбор остаточного ресурса ГРП по всем алгоритмам."""
 
-    def __init__(self, parent, db, grp_id, equipment_data, grp_name=None):
+    def __init__(self, parent, db, grp_id, equipment_data, grp_name=None,
+                 params: AlgorithmParams = None, on_params=None):
         self.parent = parent
         self.db = db
         self.grp_id = grp_id
         self.grp_name = grp_name or f'ГРП №{grp_id}'
         self.equipment_data = equipment_data or []
-        self.params = AlgorithmParams()
+        # on_params вызывается при каждом пересчёте с новыми коэффициентами:
+        # главное окно запоминает их, чтобы Word-отчёт считался с теми же
+        # значениями, что показаны здесь.
+        self._on_params = on_params
+        self.params = copy.deepcopy(params) if params else AlgorithmParams()
         self.results = {}
         self.warnings = []
         self.journal = {}
+
+        # Таблицы рисуются темой clam: тема Windows не даёт задать им цвет.
+        # Тема в интерпретаторе общая, поэтому её нужно вернуть при выходе —
+        # иначе главное окно останется в чужом оформлении.
+        self._theme_saved = calc_theme()
 
         self.window = tk.Toplevel(parent)
         self.window.title(f'Остаточный ресурс · {self.grp_name}')
         self.window.configure(bg=BG)
         self.window.transient(parent)
         self.window.grab_set()
+        self.window.bind('<Destroy>', self._on_destroy, add='+')
 
         self._build_ui()
         self.calculate_and_display()
@@ -495,29 +494,20 @@ class AlgorithmsWindow:
         # 1560x900 не влезало — размер считается от запроса виджетов и экрана.
         fit_window(self.window, min_width=900, min_height=560)
 
+    def _on_destroy(self, _event=None):
+        restore_theme(self._theme_saved)
+
     # ------------------------------------------------------------------ UI
 
-    def _init_styles(self):
-        """Шрифт и высота строк таблиц разбора.
-
-        Tk по умолчанию рисует строки около 20 px шрифтом 8 pt, в таблице
-        расчёта по элементам это читается мелко. Стиль задаётся один раз на
-        окно и используется только таблицами разбора — вкладки ввода и
-        коэффициентов остались как были.
-        """
-        style = ttk.Style()
-        style.configure('Calc.Treeview', font=('Segoe UI', 10), rowheight=28)
-        style.configure('Calc.Treeview.Heading', font=('Segoe UI', 10, 'bold'))
-
     def _build_ui(self):
-        self._init_styles()
         self._build_header()
-        self.notebook = ttk.Notebook(self.window)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+        self.notebook = ttk.Notebook(self.window, style='Calc.TNotebook')
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=14, pady=(12, 14))
+        self._build_algorithm_bar()
 
         # Методики переключаются вертикальной лентой слева, а не вкладками
         # ноутбука: их пять, они равноправны и должны быть видны одновременно,
-        # чтобы можно было сравнивать остаток не переклюкаясь туда-сюда.
+        # чтобы можно было сравнивать остаток не переключаясь туда-сюда.
         self.tab_algorithms = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_algorithms, text='  Алгоритмы  ')
 
@@ -538,7 +528,6 @@ class AlgorithmsWindow:
         self._build_method_tab()
 
         self._algo_var = tk.IntVar(value=PRIMARY_ALGORITHM)
-        self._build_algorithm_bar()
         self._build_algorithms_tab()
         self._build_horizon_tab()
         self._build_coefficients_tab()
@@ -553,19 +542,23 @@ class AlgorithmsWindow:
         inner = tk.Frame(header, bg='#ffffff')
         inner.pack(fill=tk.X, padx=18, pady=12)
 
-        left = tk.Frame(inner, bg='#ffffff')
+        left = tk.Frame(inner, bg=CARD)
         left.pack(side=tk.LEFT)
-        tk.Label(left, text='Остаточный ресурс ГРП', bg='#ffffff', fg=TEXT,
-                 font=('Segoe UI', 17, 'bold')).pack(anchor=tk.W)
-        self.header_sub = tk.Label(left, text=self.grp_name, bg='#ffffff', fg=MUTED,
-                                   font=('Segoe UI', 10))
+        tk.Label(left, text='Остаточный ресурс ГРП', bg=CARD, fg=TEXT,
+                 font=('Segoe UI', 18, 'bold')).pack(anchor=tk.W)
+        self.header_sub = tk.Label(left, text=self.grp_name, bg=CARD, fg=SUB,
+                                   font=F_BODY)
         self.header_sub.pack(anchor=tk.W)
 
-        right = tk.Frame(inner, bg='#ffffff')
+        right = tk.Frame(inner, bg=CARD)
         right.pack(side=tk.RIGHT)
         _btn(right, 'Пересчитать', self.calculate_and_display,
-             color='success').pack(side=tk.RIGHT, padx=(6, 0))
+             color='success').pack(side=tk.RIGHT, padx=(8, 0))
         _btn(right, 'Закрыть', self.window.destroy, color='muted').pack(side=tk.RIGHT)
+
+    def _algo_choices(self):
+        """Подписи методик для выпадающих списков: пять штук, номера 1-5."""
+        return [f'{algo_label(i)} · {ALGORITHM_TITLES[i]}' for i in range(5)]
 
     def _build_algorithm_bar(self):
         """Переключатель методики для детальных вкладок."""
@@ -574,24 +567,24 @@ class AlgorithmsWindow:
 
         left = tk.Frame(bar, bg=BG)
         left.pack(side=tk.LEFT)
-        tk.Label(left, text='Методика:', bg=BG, fg=MUTED,
-                 font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=(0, 8))
-        chooser = ttk.Combobox(left, state='readonly', width=46,
-                               values=[f'{algo_label(i)} · {ALGORITHM_TITLES[i]}'
-                                       for i in range(5)],
-                               font=('Segoe UI', 10))
+        tk.Label(left, text='Методика', bg=BG, fg=TEXT,
+                 font=F_TABLE_B).pack(side=tk.LEFT, padx=(0, 10))
+        chooser = ttk.Combobox(left, state='readonly', width=52,
+                               values=self._algo_choices(),
+                               font=F_BODY, style='Calc.TCombobox')
         chooser.current(PRIMARY_ALGORITHM)
         chooser.bind('<<ComboboxSelected>>', self._on_algorithm_changed)
         chooser.pack(side=tk.LEFT)
         self._combo_algo = chooser
 
-        self.algo_hint = tk.Label(bar, text='', bg=BG, fg=MUTED, font=('Segoe UI', 10))
-        self.algo_hint.pack(side=tk.LEFT, padx=12)
+        self.algo_hint = tk.Label(bar, text='', bg=BG, fg=TEXT, font=F_BODY)
+        self.algo_hint.pack(side=tk.LEFT, padx=14)
 
     def _on_algorithm_changed(self, _event=None):
         self._algo_var.set(self._combo_algo.current())
         self.render_coefficients()
         self.render_trace()
+
     # ------------------------------------------------- Вертикальные вкладки
 
     def _build_algorithms_tab(self):
@@ -610,71 +603,74 @@ class AlgorithmsWindow:
         self._coefficients_now = {}
         self._ladders = {}
 
-        rail = tk.Frame(wrap, bg=BG, width=236)
+        # Лента методик. Плитки компактные и не переносятся: пять методик
+        # должны помещаться в ленту целиком при любой высоте окна, иначе
+        # последняя методика просто уезжает за нижний край и её не видно.
+        rail = tk.Frame(wrap, bg=BG, width=RAIL_W)
         rail.pack(side=tk.LEFT, fill=tk.Y)
         rail.pack_propagate(False)
-        tk.Label(rail, text='МЕТОДИКА', bg=BG, fg=MUTED,
-                 font=('Segoe UI', 9, 'bold')).pack(anchor=tk.W, pady=(0, 6))
         for number in range(5):
-            self.algo_tabs.append(
-                self._build_vertical_tab(rail, number))
+            self.algo_tabs.append(self._build_vertical_tab(rail, number))
 
         holder = tk.Frame(wrap, bg=BG)
         holder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
         for number in range(5):
-            pane = tk.Frame(holder, bg=BG)
+            pane = Pane(holder)
             self.algo_panes.append(pane)
             self._build_algorithm_pane(pane, number)
         self._select_algorithm(PRIMARY_ALGORITHM)
+
     def _build_vertical_tab(self, parent, number):
-        """Плитка методики в вертикальной ленте: номер, имя и остаток."""
+        """Плитка методики в ленте: номер, короткое имя и остаток."""
         outer = tk.Frame(parent, bg=BG)
-        outer.pack(fill=tk.X, pady=(0, 4))
+        outer.pack(fill=tk.X, pady=(0, 5))
 
         active = tk.Frame(outer, bg=BG, width=4)
         active.pack(side=tk.LEFT, fill=tk.Y)
 
-        card = tk.Frame(outer, bg=CARD, highlightbackground=LINE,
+        tile = tk.Frame(outer, bg=CARD, highlightbackground=LINE,
                         highlightthickness=1, bd=0, cursor='hand2')
-        card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        tile.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
 
-        head = tk.Frame(card, bg=CARD, cursor='hand2')
-        head.pack(fill=tk.X, padx=12, pady=(9, 0))
-        number_label = tk.Label(head, text=f'Алг {algo_number(number)}', bg=CARD, fg=ACCENT,
-                                font=('Segoe UI', 12, 'bold'), cursor='hand2')
+        top = tk.Frame(tile, bg=CARD, cursor='hand2')
+        top.pack(fill=tk.X, padx=12, pady=(8, 0))
+        number_label = tk.Label(top, text=algo_label(number), bg=CARD, fg=ACCENT,
+                                font=('Segoe UI', 11, 'bold'), cursor='hand2')
         number_label.pack(side=tk.LEFT)
-        badge = tk.Label(head, text='—', bg=CARD, fg=MUTED,
-                         font=('Segoe UI', 11, 'bold'), cursor='hand2')
+        badge = tk.Label(top, text='—', bg=CARD, fg=SUB,
+                         font=F_TABLE_B, cursor='hand2')
         badge.pack(side=tk.RIGHT)
 
-        title = tk.Label(card, text=ALGORITHM_TITLES[number], bg=CARD, fg=MUTED,
-                         font=('Segoe UI', 9), wraplength=180, justify=tk.LEFT,
-                         anchor=tk.W, cursor='hand2')
-        title.pack(fill=tk.X, padx=12, pady=(2, 10))
+        # Короткое имя методики: длинное не помещается в плитку в одну строку,
+        # а перенос съедал бы высоту, которой ленте и так не хватает.
+        title = tk.Label(tile, text=ALGORITHM_SHORT[number], bg=CARD, fg=SUB,
+                         font=F_BODY, anchor=tk.W, justify=tk.LEFT,
+                         cursor='hand2')
+        title.pack(fill=tk.X, padx=12, pady=(1, 8))
 
-        widgets = (outer, active, card, head, number_label, badge, title)
+        widgets = (outer, active, tile, top, number_label, badge, title)
         for widget in widgets:
             widget.bind('<Button-1>',
                         lambda _e, n=number: self._select_algorithm(n))
             widget.bind('<Enter>', lambda _e, n=number: self._hover_tab(n, True))
             widget.bind('<Leave>', lambda _e, n=number: self._hover_tab(n, False))
-        return {'outer': outer, 'active': active, 'card': card, 'head': head,
+        return {'outer': outer, 'active': active, 'card': tile, 'head': top,
                 'number': number_label, 'badge': badge, 'title': title}
 
     def _hover_tab(self, number, active):
         """Подсветка плитки под курсором, если она не выбрана."""
         if number == self._selected_algorithm:
             return
-        card = self.algo_tabs[number]['card']
-        card.config(bg='#eef3fe' if active else CARD)
+        self.algo_tabs[number]['card'].config(bg='#eaf0fd' if active else CARD)
 
     def _select_algorithm(self, number):
         """Показывает панель методики и перекрашивает ленту."""
         self._selected_algorithm = number
         self._algo_var.set(number)
-        for other, pane in enumerate(self.algo_panes):
+        for pane in self.algo_panes:
             pane.pack_forget()
         self.algo_panes[number].pack(fill=tk.BOTH, expand=True)
+        self.algo_panes[number].to_top()
         self._paint_algo_tabs()
         if self.results:
             self._render_extension(number)
@@ -683,77 +679,75 @@ class AlgorithmsWindow:
         """Активная методика — белой плиткой с полосой, остальные приглушены."""
         for number, tab in enumerate(self.algo_tabs):
             selected = number == self._selected_algorithm
-            card, active = tab['card'], tab['active']
-            card.config(bg=CARD if selected else '#f0f3f7',
+            tile, active = tab['card'], tab['active']
+            bg = CARD if selected else '#f1f4f9'
+            tile.config(bg=bg,
                         highlightbackground=ACCENT if selected else LINE)
             active.config(bg=ACCENT if selected else BG)
-            head, badge = tab['head'], tab['badge']
-            head.config(bg=card.cget('bg'))
-            badge.config(bg=card.cget('bg'),
-                         font=('Segoe UI', 11, 'bold' if selected else 'normal'))
+            tab['head'].config(bg=bg)
+            tab['badge'].config(bg=bg)
             tab['number'].config(
-                bg=card.cget('bg'),
-                fg=ACCENT if selected else MUTED,
-                font=('Segoe UI', 12, 'bold') if selected else ('Segoe UI', 11))
-            tab['title'].config(bg=card.cget('bg'),
-                                fg=TEXT if selected else MUTED)
+                bg=bg,
+                fg=ACCENT if selected else SUB,
+                font=('Segoe UI', 11, 'bold') if selected else ('Segoe UI', 11))
+            tab['title'].config(bg=bg, fg=TEXT if selected else SUB)
 
     def _build_algorithm_pane(self, tab, number):
         """Панель одной методики: остаток, список замен и продление срока."""
-        top = _card(tab)
-        top.pack(fill=tk.X)
-        tk.Label(top, text=f'{algo_label(number)} · {ALGORITHM_TITLES[number]}',
-                 bg=CARD, fg=MUTED, font=('Segoe UI', 10)).pack(
-            anchor=tk.W, padx=18, pady=(12, 0))
-        body = tk.Frame(top, bg=CARD)
-        body.pack(fill=tk.X, padx=18, pady=(4, 12))
-        self.algo_values[number] = tk.Label(body, text='—', bg=CARD, fg=TEXT,
-                                           font=('Segoe UI', 34, 'bold'))
-        self.algo_values[number].pack(side=tk.LEFT, anchor=tk.W)
-        info = tk.Frame(body, bg=CARD)
-        info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(24, 0),
-                  anchor=tk.W)
-        self.algo_metas[number] = tk.Label(info, text='', bg=CARD, fg=MUTED,
-                                          font=('Segoe UI', 10), justify=tk.LEFT)
-        self.algo_metas[number].pack(anchor=tk.W)
-        self.algo_notes[number] = tk.Label(info, text='', bg=CARD, fg=MUTED,
-                                          font=('Segoe UI', 9), justify=tk.LEFT,
-                                          wraplength=780)
-        self.algo_notes[number].pack(anchor=tk.W, pady=(4, 0))
+        body = tab.body
+        body.pack_configure(fill=tk.X, padx=14, pady=(0, 14))
 
-        self._build_soon_card(tab, number)
-        self._build_extension_card(tab, number)
-        self._build_elements_card(tab, number)
+        top = card(body)
+        top.pack(fill=tk.X)
+        head_row(top).pack_forget()
+        caption = tk.Frame(top, bg=CARD)
+        caption.pack(fill=tk.X, padx=18, pady=(12, 0))
+        card_title(caption, f'{algo_label(number)} · {ALGORITHM_TITLES[number]}').pack(
+            side=tk.LEFT)
+
+        row = tk.Frame(top, bg=CARD)
+        row.pack(fill=tk.X, padx=18, pady=(4, 14))
+        self.algo_values[number] = tk.Label(row, text='—', bg=CARD, fg=TEXT,
+                                           font=F_HERO)
+        self.algo_values[number].pack(side=tk.LEFT, anchor=tk.W)
+        info = tk.Frame(row, bg=CARD)
+        info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(26, 0),
+                  anchor=tk.W)
+        self.algo_metas[number] = tk.Label(info, text='', bg=CARD, fg=TEXT,
+                                          font=F_TABLE_B, justify=tk.LEFT,
+                                          anchor=tk.W)
+        self.algo_metas[number].pack(anchor=tk.W)
+        self.algo_notes[number] = tk.Label(info, text='', bg=CARD, fg=SUB,
+                                          font=F_BODY, justify=tk.LEFT,
+                                          anchor=tk.W)
+        self.algo_notes[number].pack(anchor=tk.W, pady=(6, 0))
+
+        self._build_soon_card(body, number)
+        self._build_extension_card(body, number)
+        self._build_elements_card(body, number)
 
     # ------------------------------------------------- Скоро нужно менять
 
     def _build_soon_card(self, parent, number):
         """Список того, что скоро придётся менять, с деталями внутри строки."""
-        card = _card(parent)
-        card.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        head = tk.Frame(card, bg=CARD)
-        head.pack(fill=tk.X, padx=16, pady=(12, 0))
-        tk.Label(head, text='Скоро нужно менять', bg=CARD, fg=TEXT,
-                 font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-        tk.Label(head, text=f'остаток ≤ {_horizon_text(SOON_HORIZON)} или '
-                            f'в пределах {num(WEAK_LINK_TOLERANCE, 1)} года от '
-                            f'ближайшего · раскройте строку — внутри детали на '
-                            f'{num(PART_NORM_YEARS, 0)} лет',
-                 bg=CARD, fg=MUTED, font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=12)
-        self.soon_counts[number] = tk.Label(head, text='', bg=CARD, fg=MUTED,
-                                            font=('Segoe UI', 9, 'bold'))
+        box = card(parent)
+        box.pack(fill=tk.X, pady=(12, 0))
+        head = head_row(box)
+        card_title(head, 'Скоро нужно менять').pack(side=tk.LEFT)
+        self.soon_counts[number] = tk.Label(head, text='', bg=CARD, fg=SUB,
+                                            font=F_TABLE_B)
         self.soon_counts[number].pack(side=tk.RIGHT)
 
         self.soon_trees[number] = _tree_hier(
-            card,
+            box,
             columns=('Категория', 'Норма', 'Возраст', 'Осталось',
                      'Истекает', 'Статус'),
-            widths={'Категория': 190, 'Норма': 90, 'Возраст': 95, 'Осталось': 115,
-                    'Истекает': 105, 'Статус': 130},
-            height=6,
+            widths={'Категория': 150, 'Норма': 85, 'Возраст': 95, 'Осталось': 115,
+                    'Истекает': 110, 'Статус': 120},
+            height=5,
         )
-        for tag, color in (('soon', '#fdf3e0'), ('over', '#fbeaea'),
-                           ('part', '#f7f9fc')):
+        for tag, color in (('soon', TINT_WARN), ('over', TINT_BAD),
+                           ('part', TINT_PART)):
             self.soon_trees[number].tag_configure(tag, background=color)
 
     def _render_soon_card(self, number):
@@ -762,18 +756,21 @@ class AlgorithmsWindow:
         tree.delete(*tree.get_children())
         result = self.results.get(number)
         if result is None or result.error:
-            self.soon_counts[number].config(text='', fg=MUTED)
+            self.soon_counts[number].config(text='', fg=SUB)
+            fit_table(tree, 0)
             return
 
         used = result.used_elements
         if not used:
             self.soon_counts[number].config(text='нет элементов в расчёте', fg=BAD)
+            fit_table(tree, 0)
             return
         nearest = min(e.z_element for e in used)
         due = [e for e in used
                if e.z_element <= SOON_HORIZON
                or e.z_element <= nearest + WEAK_LINK_TOLERANCE]
 
+        rows = 0
         for element in sorted(due, key=lambda e: (e.z_element, e.name)):
             tag = 'over' if element.z_element <= 0 else 'soon'
             parent = tree.insert('', tk.END, open=True, tags=(tag,), text=(
@@ -785,11 +782,13 @@ class AlgorithmsWindow:
                 _due_date(element.z_element),
                 'просрочено' if element.z_element <= 0 else 'скоро',
             ))
+            rows += 1
             parts = [d for d in (element.details or []) if _is_counted_part(d)]
             if not parts:
                 tree.insert(parent, tk.END, tags=('part',),
                             text='нет деталей с нормой 5 лет в расчёте',
                             values=('', '—', '—', '—', '', ''))
+                rows += 1
                 continue
             for detail in sorted(parts, key=_part_residual):
                 left = _part_residual(detail)
@@ -800,50 +799,50 @@ class AlgorithmsWindow:
                     _due_date(left),
                     'просрочена' if left <= 0 else 'осталось',
                 ))
+                rows += 1
 
         self.soon_counts[number].config(
             text=f'{len(due)} из {len(used)} элементов', fg=BAD if due else GOOD)
+        fit_table(tree, rows)
 
     # ------------------------------------------------------------ Продление
 
     def _build_extension_card(self, parent, number):
         """Ползунок цели продления и список того, что придётся заменить."""
-        card = _card(parent)
-        card.pack(fill=tk.X, pady=(10, 0))
+        box = card(parent)
+        box.pack(fill=tk.X, pady=(12, 0))
 
-        head = tk.Frame(card, bg=CARD)
-        head.pack(fill=tk.X, padx=16, pady=(12, 0))
-        tk.Label(head, text='Продление срока', bg=CARD, fg=TEXT,
-                 font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-        self.ext_head[number] = tk.Label(head, text='', bg=CARD, fg=MUTED,
-                                         font=('Segoe UI', 9), justify=tk.LEFT)
-        self.ext_head[number].pack(side=tk.LEFT, padx=12)
+        head = head_row(box)
+        card_title(head, 'Продление срока').pack(side=tk.LEFT)
+        self.ext_head[number] = tk.Label(head, text='', bg=CARD, fg=SUB,
+                                         font=F_BODY, justify=tk.LEFT)
+        self.ext_head[number].pack(side=tk.LEFT, padx=14)
 
-        self.ext_targets[number] = tk.Label(card, text='', bg=CARD, fg=MUTED,
-                                            font=('Segoe UI', 11, 'bold'),
-                                            justify=tk.LEFT)
-        self.ext_targets[number].pack(anchor=tk.W, padx=16, pady=(4, 0))
-        self.ext_notes[number] = tk.Label(card, text='', bg=CARD, fg=MUTED,
-                                          font=('Segoe UI', 9), justify=tk.LEFT,
-                                          wraplength=900, anchor=tk.W)
-        self.ext_notes[number].pack(fill=tk.X, padx=16)
+        self.ext_targets[number] = tk.Label(box, text='', bg=CARD, fg=TEXT,
+                                            font=('Segoe UI', 13, 'bold'),
+                                            justify=tk.LEFT, anchor=tk.W)
+        self.ext_targets[number].pack(fill=tk.X, padx=18, pady=(6, 0))
+        self.ext_notes[number] = tk.Label(box, text='', bg=CARD, fg=SUB,
+                                          font=F_BODY, justify=tk.LEFT,
+                                          anchor=tk.W)
+        self.ext_notes[number].pack(fill=tk.X, padx=18, pady=(2, 0))
 
         self.ext_trees[number] = _tree_hier(
-            card,
+            box,
             columns=('Категория', 'Что менять', 'Срок сейчас',
                      'Срок после замены', 'Прирост'),
-            widths={'Категория': 110, 'Что менять': 420, 'Срок сейчас': 130,
-                    'Срок после замены': 140, 'Прирост': 110},
+            widths={'Категория': 130, 'Что менять': 330, 'Срок сейчас': 130,
+                    'Срок после замены': 150, 'Прирост': 115},
             height=3,
         )
-        for tag, color in (('step', '#f7f9fc'), ('last', '#e6f6ee'),
-                           ('stuck', '#fdf3e0')):
+        for tag, color in (('step', TINT_PART), ('last', TINT_GOOD),
+                           ('stuck', TINT_WARN)):
             self.ext_trees[number].tag_configure(tag, background=color)
 
-        slider_row = tk.Frame(card, bg=CARD)
-        slider_row.pack(fill=tk.X, padx=16, pady=(4, 8))
-        tk.Label(slider_row, text='хочу продлить на', bg=CARD, fg=MUTED,
-                 font=('Segoe UI', 9)).pack(anchor=tk.W)
+        slider_row = tk.Frame(box, bg=CARD)
+        slider_row.pack(fill=tk.X, padx=18, pady=(10, 14))
+        tk.Label(slider_row, text='Хочу продлить на', bg=CARD, fg=TEXT,
+                 font=F_TABLE_B).pack(anchor=tk.W, pady=(0, 2))
         self.ext_sliders[number] = HorizonSlider(
             slider_row, EXTENSION_MAX, HORIZON_SNAP,
             command=lambda _value, n=number: self._render_extension(n))
@@ -927,19 +926,21 @@ class AlgorithmsWindow:
         tree.delete(*tree.get_children())
         result = self.results.get(number)
         steps = self._extension_ladder(number)
-        head, note = self.ext_head[number], self.ext_notes[number]
+        head, hint = self.ext_head[number], self.ext_notes[number]
 
         if result is None or result.error:
             head.config(text='')
-            note.config(text='', fg=MUTED)
-            self.ext_targets[number].config(text='', fg=MUTED)
+            hint.config(text='', fg=SUB)
+            self.ext_targets[number].config(text='', fg=TEXT)
+            fit_table(tree, 0)
             return
 
         if not steps:
             head.config(text='')
             self.ext_targets[number].config(
                 text='продлить нечем: в расчёт не вошёл ни один элемент', fg=BAD)
-            note.config(text='', fg=MUTED)
+            hint.config(text='', fg=SUB)
+            fit_table(tree, 0)
             return
 
         first = steps[0]
@@ -979,26 +980,27 @@ class AlgorithmsWindow:
 
         if target <= 0:
             self.ext_targets[number].config(
-                text=f'сейчас {years_to_text(result.result)} — сдвиньте ползунок, '
-                     f'чтобы увидеть, что менять', fg=MUTED)
-            note.config(text='Продление считается заменой ближайшего слабого звена: '
+                text=f'Сейчас {years_to_text(result.result)} — сдвиньте ползунок, '
+                     f'чтобы увидеть, что менять', fg=SUB)
+            hint.config(text='Продление считается заменой ближайшего слабого звена: '
                              'по одному элементу за раз, пока не наберётся срок.',
-                        fg=MUTED)
+                        fg=SUB)
+            fit_table(tree, len(needed))
             return
 
         if reach >= goal - 1e-9:
             self.ext_targets[number].config(
-                text=f'продлить на {years_to_text(target)} → '
+                text=f'Продлить на {years_to_text(target)} → '
                      f'{years_to_text(goal)}: замен {len(needed)}', fg=GOOD)
-            note.config(text=f'Заменами подряд срок дорастает до '
+            hint.config(text=f'Заменами подряд срок дорастает до '
                              f'{years_to_text(reach)} (было '
-                             f'{years_to_text(result.result)}).', fg=MUTED)
+                             f'{years_to_text(result.result)}).', fg=SUB)
         else:
             gained = max(0.0, reach - result.result)
             self.ext_targets[number].config(
-                text=f'на {years_to_text(target)} не хватает: максимум '
+                text=f'На {years_to_text(target)} не хватает: максимум '
                      f'+{years_to_text(gained)}', fg=WARN)
-            note.config(
+            hint.config(
                 text=(f'{algo_label(number)} считает ресурс оборудования до полной '
                       f'проверки ({num(FULL_CHECK_TERM, 0)} лет) и не зависит от '
                       f'износа деталей: замена деталей его срок не двигает. '
@@ -1008,36 +1010,35 @@ class AlgorithmsWindow:
                  f'последняя замена выводит срок на {years_to_text(reach)}. '
                  f'Дальше растёт уже не ресурс, а необходимость менять '
                  f'оборудование целиком.'),
-                fg=MUTED)
+                fg=SUB)
+        fit_table(tree, len(needed))
 
     # ----------------------------------------------- Элементы и коэффициенты
 
     def _build_elements_card(self, parent, number):
         """Разбор расчёта по элементам: база, коэффициенты, остаток."""
-        card = _card(parent)
-        card.pack(fill=tk.X, pady=(10, 0))
-        tk.Label(card, text='Как посчитано: элементы и коэффициенты', bg=CARD,
-                 fg=MUTED, font=('Segoe UI', 10)).pack(anchor=tk.W, padx=14,
-                                                       pady=(10, 4))
-        self.algo_trees[number] = _tree(
-            card,
+        box = card(parent)
+        box.pack(fill=tk.X, pady=(12, 0))
+        head_row(box).pack_forget()
+        card_title(box, 'Как посчитано: элементы и коэффициенты').pack(
+            anchor=tk.W, padx=18, pady=(12, 4))
+        self.algo_trees[number] = table(
+            box,
             columns=('Элемент', 'Категория', 'Норма', 'Возраст', 'Z база',
                      'K сост', 'K эксл', 'K рем', 'k повр', 'Осталось'),
-            widths={'Элемент': 330, 'Категория': 140, 'Норма': 105, 'Возраст': 110,
-                    'Z база': 100, 'K сост': 95, 'K эксл': 95, 'K рем': 95,
-                    'k повр': 95, 'Осталось': 130},
-            height=4,
-            style='Calc.Treeview',
-            wide_first=True,
+            widths={'Элемент': 300, 'Категория': 135, 'Норма': 90, 'Возраст': 100,
+                    'Z база': 90, 'K сост': 85, 'K эксл': 85, 'K рем': 85,
+                    'k повр': 85, 'Осталось': 135},
+            height=5,
+            expand=False,
         )
-        for tag, color in (('good', '#e6f6ee'), ('warn', '#fdf3e0'),
-                           ('bad', '#fbeaea'), ('skip', '#f2f4f7')):
+        for tag, color in (('good', TINT_GOOD), ('warn', TINT_WARN),
+                           ('bad', TINT_BAD), ('skip', TINT_SKIP)):
             self.algo_trees[number].tag_configure(tag, background=color)
         self.algo_recommends[number] = tk.Label(
-            card, text='', bg=CARD, fg=ACCENT, font=('Segoe UI', 10, 'bold'),
-            justify=tk.LEFT, wraplength=1400)
-        self.algo_recommends[number].pack(anchor=tk.W, padx=14, pady=(8, 12))
-
+            box, text='', bg=CARD, fg=ACCENT, font=('Segoe UI', 11, 'bold'),
+justify=tk.LEFT, wraplength=1400)
+        self.algo_recommends[number].pack(anchor=tk.W, padx=18, pady=(10, 14))
 
     def _render_algorithm_pane(self, number):
         """Заполняет панель методики по свежему результату расчёта."""
@@ -1052,20 +1053,22 @@ class AlgorithmsWindow:
         badge = self.algo_tabs[number]['badge']
 
         if result is None:
-            value_label.config(text='\u2014', fg=BAD)
+            value_label.config(text='—', fg=BAD)
             meta_label.config(text='методика не рассчитана')
             note_label.config(text='')
             recommend.config(text='')
-            badge.config(text='\u2014', fg=MUTED)
+            badge.config(text='—', fg=SUB)
+            fit_table(tree, 0)
             self._render_soon_card(number)
             return
 
         if result.error:
-            value_label.config(text='\u2014', fg=BAD)
+            value_label.config(text='—', fg=BAD)
             meta_label.config(text=result.error)
             note_label.config(text='')
             recommend.config(text='')
             badge.config(text='ошибка', fg=BAD)
+            fit_table(tree, 0)
             self._render_soon_card(number)
             return
 
@@ -1117,54 +1120,48 @@ class AlgorithmsWindow:
         wrap = tk.Frame(self.tab_horizon, bg=BG)
         wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
 
-        top = _card(wrap)
+        top = card(wrap)
         top.pack(fill=tk.X)
 
-        head = tk.Frame(top, bg=CARD)
-        head.pack(fill=tk.X, padx=18, pady=(12, 0))
-        tk.Label(head, text='Что нужно заменить', bg=CARD, fg=MUTED,
-                 font=('Segoe UI', 10)).pack(side=tk.LEFT)
-        chooser = ttk.Combobox(head, state='readonly', width=42,
-                               values=[f'{algo_label(i)} · {ALGORITHM_TITLES[i]}'
-                                       for i in range(5)],
-                               font=('Segoe UI', 10))
+        head = head_row(top, padx=18)
+        card_title(head, 'Что нужно заменить').pack(side=tk.LEFT)
+        chooser = ttk.Combobox(head, state='readonly', width=48,
+                               values=self._algo_choices(),
+                               font=F_BODY, style='Calc.TCombobox')
         chooser.current(PRIMARY_ALGORITHM)
         chooser.bind('<<ComboboxSelected>>', self._on_horizon_algorithm)
         chooser.pack(side=tk.RIGHT)
         self._combo_horizon_algo = chooser
 
         slider_row = tk.Frame(top, bg=CARD)
-        slider_row.pack(fill=tk.X, padx=18, pady=(6, 0))
+        slider_row.pack(fill=tk.X, padx=18, pady=(10, 0))
         self.horizon_slider = HorizonSlider(slider_row, HORIZON_MAX,
                                             HORIZON_SNAP,
                                             command=self._on_horizon_changed)
         self.horizon_slider.pack(fill=tk.X, expand=True)
-        tk.Label(slider_row, text='тяните мышью · ← → по месяцу · Home/End',
-                 bg=CARD, fg=MUTED, font=('Segoe UI', 8)).pack(
-            anchor=tk.E, pady=(0, 4))
 
         readout = tk.Frame(top, bg=CARD)
-        readout.pack(fill=tk.X, padx=18, pady=(0, 12))
+        readout.pack(fill=tk.X, padx=18, pady=(2, 14))
         self.horizon_label = tk.Label(readout, text='', bg=CARD, fg=TEXT,
-                                      font=('Segoe UI', 15, 'bold'))
+                                      font=('Segoe UI', 16, 'bold'))
         self.horizon_label.pack(side=tk.LEFT)
-        self.horizon_count = tk.Label(readout, text='', bg=CARD, fg=MUTED,
-                                      font=('Segoe UI', 10), justify=tk.LEFT)
-        self.horizon_count.pack(side=tk.LEFT, padx=(18, 0))
+        self.horizon_count = tk.Label(readout, text='', bg=CARD, fg=TEXT,
+                                      font=F_BODY, justify=tk.LEFT, anchor=tk.W)
+        self.horizon_count.pack(side=tk.LEFT, padx=(20, 0))
 
-        table = _card(wrap)
-        table.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        self.tree_horizon = _tree(
-            table,
+        box = card(wrap)
+        box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        self.tree_horizon = table(
+            box,
             columns=('Элемент', 'Тип', 'Деталь', 'Норма детали', 'Возраст детали',
                      'Осталось детали', 'Осталось элемента', 'К замене'),
-            widths={'Элемент': 300, 'Тип': 110, 'Деталь': 330, 'Норма детали': 100,
-                    'Возраст детали': 110, 'Осталось детали': 120,
-                    'Осталось элемента': 130, 'К замене': 100},
+            widths={'Элемент': 290, 'Тип': 110, 'Деталь': 300, 'Норма детали': 105,
+                    'Возраст детали': 115, 'Осталось детали': 125,
+                    'Осталось элемента': 140, 'К замене': 105},
             height=12,
         )
-        for tag, color in (('good', '#e6f6ee'), ('warn', '#fdf3e0'),
-                           ('bad', '#fbeaea')):
+        for tag, color in (('good', TINT_GOOD), ('warn', TINT_WARN),
+                           ('bad', TINT_BAD)):
             self.tree_horizon.tag_configure(tag, background=color)
 
     def _on_horizon_algorithm(self, _event=None):
@@ -1248,40 +1245,49 @@ class AlgorithmsWindow:
     # -------------------------------------------------------- Коэффициенты
 
     def _build_coefficients_tab(self):
-        tk.Label(self.tab_coefficients,
-                 text='Поэлементный расчёт коэффициентов. Пустая ячейка с прочерком '
-                      'означает, что данных нет и коэффициент принят равным 1.',
-                 bg=BG, fg=MUTED, font=('Segoe UI', 9)).pack(anchor=tk.W, pady=(10, 6))
+        wrap = tk.Frame(self.tab_coefficients, bg=BG)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        box = card(wrap)
+        box.pack(fill=tk.BOTH, expand=True)
 
-        self.tree_coefficients = _tree(
-            self.tab_coefficients,
+        self.tree_coefficients = table(
+            box,
             columns=('Элемент', 'Категория', 'S_нач', 'Возраст', 'Z_база', 'Вариант',
                      'K_сост', 'K_эксл', 'K_рем', 'k_повр', 'Z_эл', 'Формула Z_эл'),
-            widths={'Элемент': 240, 'Категория': 190, 'S_нач': 90, 'Возраст': 95,
-                    'Z_база': 80, 'Вариант': 70, 'K_сост': 80, 'K_эксл': 75,
-                    'K_рем': 70, 'k_повр': 75, 'Z_эл': 85, 'Формула Z_эл': 430},
+            widths={'Элемент': 235, 'Категория': 160, 'S_нач': 80, 'Возраст': 88,
+                    'Z_база': 78, 'Вариант': 68, 'K_сост': 76, 'K_эксл': 74,
+                    'K_рем': 70, 'k_повр': 74, 'Z_эл': 82, 'Формула Z_эл': 300},
             height=16,
         )
-        self.tree_coefficients.tag_configure('weak', background='#fbeaea')
-        self.tree_coefficients.tag_configure('skip', foreground='#9aa5b1')
-        self.tree_coefficients.tag_configure('zero', background='#fdf3e0')
+        self.tree_coefficients.tag_configure('weak', background=TINT_BAD)
+        self.tree_coefficients.tag_configure('skip', background=TINT_SKIP,
+                                             foreground=SUB)
+        self.tree_coefficients.tag_configure('zero', background=TINT_WARN)
 
     # ------------------------------------------------------------ Трассировка
 
     def _build_trace_tab(self):
-        bar = tk.Frame(self.tab_trace, bg=BG)
-        bar.pack(fill=tk.X, padx=14, pady=(10, 0))
-        _btn(bar, 'Скопировать трассировку', self._copy_trace,
-             color='muted', font_size=9).pack(side=tk.RIGHT)
+        wrap = tk.Frame(self.tab_trace, bg=BG)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        box = card(wrap)
+        box.pack(fill=tk.BOTH, expand=True)
 
-        self.text_trace = _text_block(self.tab_trace, height=30)
+        bar = tk.Frame(box, bg=CARD)
+        bar.pack(fill=tk.X, padx=18, pady=(12, 0))
+        card_title(bar, 'Пошаговый расчёт').pack(side=tk.LEFT)
+        _btn(bar, 'Скопировать', self._copy_trace,
+             color='muted').pack(side=tk.RIGHT)
+
+        self.text_trace = _text_block(box, height=30)
         for level, (color, bold, italic) in TRACE_COLORS.items():
             self.text_trace.tag_configure(
                 level, foreground=color,
-                font=('Consolas', 10, 'bold') if bold else ('Consolas', 10, 'italic')
-                if italic else ('Consolas', 10),
+                font=('Consolas', 11, 'bold') if bold
+                else ('Consolas', 11, 'italic') if italic
+                else ('Consolas', 11),
             )
-        self.text_trace.tag_configure('element', foreground='#7b3fa0', font=('Consolas', 10, 'bold'))
+        self.text_trace.tag_configure('element', foreground='#7b3fa0',
+                                      font=('Consolas', 11, 'bold'))
 
     def _copy_trace(self):
         text = self.text_trace.get('1.0', tk.END)
@@ -1295,93 +1301,94 @@ class AlgorithmsWindow:
         wrap = tk.Frame(self.tab_inputs, bg=BG)
         wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
 
-        params_card = _card(wrap)
-        params_card.pack(fill=tk.X, pady=(0, 10))
+        params_card = card(wrap)
+        params_card.pack(fill=tk.X, pady=(0, 12))
         self._build_params_panel(params_card)
 
-        journal_card = _card(wrap)
-        journal_card.pack(fill=tk.X, pady=(0, 10))
+        journal_card = card(wrap)
+        journal_card.pack(fill=tk.X, pady=(0, 12))
         self._build_journal_panel(journal_card)
 
-        tk.Label(wrap, text='Что поступило в расчёт по каждому элементу',
-                 bg=BG, fg=MUTED, font=('Segoe UI', 10)).pack(anchor=tk.W)
-        self.tree_inputs = _tree(
-            wrap,
+        box = card(wrap)
+        box.pack(fill=tk.BOTH, expand=True)
+        card_title(box, 'Что поступило в расчёт по каждому элементу').pack(
+            anchor=tk.W, padx=18, pady=(12, 4))
+        self.tree_inputs = table(
+            box,
             columns=('Элемент', 'Категория', 'S_нач', 'Источник', 'Детали',
                      'Z_база', 'Отказы', 'Повреж.', 'Ремонт', 'В расчёте'),
-            widths={'Элемент': 230, 'Категория': 170, 'S_нач': 90, 'Источник': 175,
-                    'Детали': 70, 'Z_база': 70, 'Отказы': 60, 'Повреж.': 70,
-                    'Ремонт': 145, 'В расчёте': 210},
+            widths={'Элемент': 230, 'Категория': 165, 'S_нач': 85, 'Источник': 170,
+                    'Детали': 70, 'Z_база': 80, 'Отказы': 65, 'Повреж.': 75,
+                    'Ремонт': 140, 'В расчёте': 200},
             height=9,
         )
-        self.tree_inputs.tag_configure('skip', foreground='#9aa5b1')
-        self.tree_inputs.tag_configure('weak', background='#fbeaea')
+        self.tree_inputs.tag_configure('skip', background=TINT_SKIP,
+                                       foreground=SUB)
+        self.tree_inputs.tag_configure('weak', background=TINT_BAD)
 
     def _build_params_panel(self, parent):
-        head = tk.Frame(parent, bg=CARD)
-        head.pack(fill=tk.X, padx=16, pady=(12, 0))
-        tk.Label(head, text='Весовые коэффициенты методики', bg=CARD, fg=TEXT,
-                 font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-        tk.Label(head, text='значения по умолчанию — рекомендуемые методикой; '
-                            'меняются под конкретный объект',
-                 bg=CARD, fg=MUTED, font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=12)
+        head = head_row(parent, padx=18)
+        card_title(head, 'Весовые коэффициенты методики').pack(side=tk.LEFT)
 
         body = tk.Frame(parent, bg=CARD)
-        body.pack(fill=tk.X, padx=16, pady=(8, 12))
+        body.pack(fill=tk.X, padx=18, pady=(10, 16))
 
         fields = [
-            ('alpha_fail', 'α — вес отказа', '0,15'),
-            ('beta_damage', 'β — вес повреждения', '0,10'),
-            ('theta_conditions', 'θ — условия эксплуатации', '0,10'),
-            ('delta_repair', 'δ — качество ремонта', '0,10'),
-            ('reserve', 'K запаса', '0,50'),
-            ('max_diag_interval', 'T макс. диагностики', '5'),
+            ('alpha_fail', 'α — вес отказа', 2),
+            ('beta_damage', 'β — вес повреждения', 2),
+            ('theta_conditions', 'θ — условия эксплуатации', 2),
+            ('delta_repair', 'δ — качество ремонта', 2),
+            ('reserve', 'K запаса', 2),
+            ('max_diag_interval', 'T макс. диагностики', 1),
         ]
         self._param_entries = {}
-        for row, (attr, label, default) in enumerate(fields):
+        self._param_digits = {attr: digits for attr, _, digits in fields}
+        for row, (attr, label, _) in enumerate(fields):
             column = row % 4
             block = tk.Frame(body, bg=CARD)
             block.grid(row=row // 4, column=column, sticky=tk.W,
-                       padx=(0, 22), pady=4)
-            tk.Label(block, text=label, bg=CARD, fg=MUTED,
-                     font=('Segoe UI', 9)).pack(anchor=tk.W)
-            entry = tk.Entry(block, width=8, font=('Consolas', 10), bd=1,
-                             relief='solid', highlightthickness=0, justify=tk.RIGHT)
-            entry.insert(tk.END, default)
-            entry.pack(anchor=tk.W, pady=(2, 0))
+                       padx=(0, 24), pady=6)
+            tk.Label(block, text=label, bg=CARD, fg=TEXT,
+                     font=F_BODY).pack(anchor=tk.W)
+            entry = ttk.Entry(block, width=9, font=('Consolas', 11),
+                              style='Calc.TEntry', justify=tk.RIGHT)
+            entry.insert(tk.END, num(getattr(self.params, attr),
+                                     self._param_digits[attr]))
+            entry.pack(anchor=tk.W, pady=(4, 0))
             self._param_entries[attr] = entry
 
         actions = tk.Frame(body, bg=CARD)
-        actions.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
+        actions.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(14, 0))
         _btn(actions, 'Пересчитать с этими коэффициентами',
              self._apply_params, color='success').pack(side=tk.LEFT)
         _btn(actions, 'Вернуть методические значения',
-             self._reset_params, color='muted').pack(side=tk.LEFT, padx=8)
+             self._reset_params, color='muted').pack(side=tk.LEFT, padx=10)
 
     def _build_journal_panel(self, parent):
-        head = tk.Frame(parent, bg=CARD)
-        head.pack(fill=tk.X, padx=16, pady=(12, 0))
-        tk.Label(head, text='Журнал технической диагностики (A, B, C → K общ)',
-                 bg=CARD, fg=TEXT, font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
+        head = head_row(parent, padx=18)
+        card_title(head, 'Журнал технической диагностики (A, B, C → K общ)').pack(
+            side=tk.LEFT)
 
         body = tk.Frame(parent, bg=CARD)
-        body.pack(fill=tk.X, padx=16, pady=(8, 12))
-        self._journal_text = tk.Label(body, text='—', bg=CARD, fg=MUTED,
-                                      font=('Segoe UI', 10), justify=tk.LEFT,
+        body.pack(fill=tk.X, padx=18, pady=(10, 16))
+        self._journal_text = tk.Label(body, text='—', bg=CARD, fg=TEXT,
+                                      font=F_BODY, justify=tk.LEFT,
                                       anchor=tk.W)
         self._journal_text.pack(fill=tk.X)
 
     def _read_params(self) -> AlgorithmParams:
-        values = {}
+        """Читает коэффициенты из полей; некорректное значение игнорируется.
+
+        В основу берётся текущий self.params, а не новый экземпляр: так
+        нераспознанное поле не сбрасывает остальные на методические значения.
+        """
+        base = copy.deepcopy(self.params)
         for attr, entry in self._param_entries.items():
             raw = entry.get().replace(',', '.').strip()
             try:
-                values[attr] = float(raw)
+                setattr(base, attr, float(raw))
             except ValueError:
                 pass
-        base = AlgorithmParams()
-        for attr in values:
-            setattr(base, attr, values[attr])
         return base
 
     def _apply_params(self):
@@ -1390,10 +1397,10 @@ class AlgorithmsWindow:
 
     def _reset_params(self):
         self.params = AlgorithmParams()
-        digits = {'max_diag_interval': 1}
         for attr, entry in self._param_entries.items():
             entry.delete(0, tk.END)
-            entry.insert(tk.END, num(getattr(self.params, attr), digits.get(attr, 2)))
+            entry.insert(tk.END, num(getattr(self.params, attr),
+                                     self._param_digits[attr]))
         self.calculate_and_display()
 
     # ------------------------------------------------------------ Методика
@@ -1401,10 +1408,12 @@ class AlgorithmsWindow:
     def _build_method_tab(self):
         wrap = tk.Frame(self.tab_method, bg=BG)
         wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
-        box = _text_block(wrap, height=30, font=('Segoe UI', 10))
-        box.tag_configure('h', foreground=ACCENT, font=('Segoe UI', 12, 'bold'))
-        box.tag_configure('f', foreground='#0b3d91', font=('Consolas', 10))
-        box.tag_configure('s', foreground=MUTED, font=('Segoe UI', 9, 'italic'))
+        holder = card(wrap)
+        holder.pack(fill=tk.BOTH, expand=True)
+        box = _text_block(holder, height=30, font=('Segoe UI', 11))
+        box.tag_configure('h', foreground=ACCENT, font=('Segoe UI', 13, 'bold'))
+        box.tag_configure('f', foreground='#123a8f', font=('Consolas', 11))
+        box.tag_configure('s', foreground=SUB, font=('Segoe UI', 10))
 
         def put(text, tag=None):
             box.insert(tk.END, text, tag)
@@ -1446,23 +1455,23 @@ class AlgorithmsWindow:
         put('Zэл = Zбаза · Kсост · Kэксл · Kрем · kповр\n\n', 'f')
 
         put('Шаги 9-11. Итог по ГРП\n', 'h')
-        put('Алгоритмы 3, 4, 5:  ZГРП = min (Zрег; Zпзк; Zпск; Zфильтр; Zарматура)\n', 'f')
-        put('Алгоритм 1:  ZГРП = Σ Zэл / m      (среднее арифметическое)\n', 'f')
-        put('Алгоритм 2:  ZГРП = (Σ Zэл / m) · Kобщ,  Kобщ = 1 − (A + B + C)\n', 'f')
-        put('Алгоритм 5:  Zбаза = Zкаленд = Sнач − Sфакт (срок полной проверки '
+        weak_link_algos = ', '.join(algo_label(n) for n in WEAK_LINK_ALGORITHMS)
+        put(f'{weak_link_algos}:  ZГРП = min (Zрег; Zпзк; Zпск; Zфильтр; Zарматура)\n',
+            'f')
+        put(f'{algo_label(0)}:  ZГРП = Σ Zэл / m      (среднее арифметическое)\n', 'f')
+        put(f'{algo_label(1)}:  ZГРП = (Σ Zэл / m) · Kобщ,  '
+            'Kобщ = 1 − (A + B + C)\n', 'f')
+        put(f'{algo_label(4)}:  Zбаза = Zкаленд = Sнач − Sфакт (срок полной проверки '
             'минус возраст оборудования)\n', 'f')
         put('Взвешивание с фактической наработкой (α·Zкаленд + (1−α)·Zнаработка) '
             'не применяется: телеметрии по элементам нет.\n', 's')
         put('Tдиагн = min (ZГРП · Kзапаса ; Tмакс)\n\n', 'f')
 
         put('ИСТОЧНИКИ (папка docs/)\n', 'h')
-        put('«Алгоритм 3-без календаря-5+.pdf» — скорректированная редакция методики 4: '
-            'приоритет наработки, двойной учёт Kсост, некратные замены, Tдиагн.\n', 's')
-        put('«Алг3-схема данных.pdf» — привязка шагов к цифровому паспорту ГРП, '
-            'сквозной пример ГРП №26.\n', 's')
-        put('«Алгоритм4.pdf» — источник методики 5; из него взята календарная база, '
-            'взвешивание с наработкой отключено.\n', 's')
-        put('«Алгоритмы-(все до корректировки).pdf» — методики 1-3.\n', 's')
+        put('Нумерация методик в приложении своя (1-5) и не совпадает с '
+            'нумерацией в исходных документах (1-4). Соответствие:\n', 's')
+        for _n in range(5):
+            put(f'{algo_label(_n)} — {ALGORITHM_TITLES[_n]}: {algo_source(_n)}\n', 's')
         put('«Методика оценки фактической наработки отключающего устройства на входе.docx» '
             '— правила учёта наработки.\n', 's')
         put('«Методика определения назначенных показателей долговечности элементов ГРП '
@@ -1487,6 +1496,9 @@ class AlgorithmsWindow:
         except Exception as exc:  # noqa: BLE001 — окно не должно падать
             messagebox.showerror('Ошибка расчёта', f'Не удалось выполнить расчёт:\n{exc}')
             return
+
+        if self._on_params is not None:
+            self._on_params(copy.deepcopy(self.params))
 
         self._audit_results()
         for number in range(5):
@@ -1545,8 +1557,8 @@ class AlgorithmsWindow:
                 'иначе используется упрощённый календарный вариант.')
         if not coefficients:
             warnings.append(
-                'Журнал технической диагностики пуст: в Алгоритме 1 общий коэффициент '
-                'Kобщ = 1, оценка получается завышенной.')
+                f'Журнал технической диагностики пуст: в {algo_label(1)} общий '
+                'коэффициент Kобщ = 1, оценка получается завышенной.')
         if not journal:
             warnings.append(
                 'Журнал замен пуст: Nотказ = 0 и Nповрежд = 0, поэтому kповр = 1 для '
@@ -1681,11 +1693,11 @@ class AlgorithmsWindow:
         if skipped:
             self.warnings.append(
                 f'Не вошли в расчёт как некритические: {len(skipped)} элементов '
-                f'(учитываются только в Алгоритмах 0 и 1).')
+                f'(учитываются только в {algo_label(0)} и {algo_label(1)}).')
 
     def _render_journal_card(self, coefficients):
         if not coefficients:
-            self._journal_text.config(text='Записей нет — Kобщ = 1,000 (Алгоритм 2 '
+            self._journal_text.config(text=f'Записей нет — Kобщ = 1,000 ({algo_label(1)} '
                                            'не снижает оценку)')
             return
         a, b, c = coefficients.get('a'), coefficients.get('b'), coefficients.get('c')
@@ -1739,7 +1751,7 @@ class AlgorithmsWindow:
         used = len(result.used_elements) if result else 0
         self.header_sub.config(
             text=f'{self.grp_name}  ·  элементов в расчёте: {used}'
-                 f'  ·  методика: алгоритм {PRIMARY_ALGORITHM}')
+                 f'  ·  методика: {algo_label(PRIMARY_ALGORITHM)}')
 
     def render_coefficients(self):
         """Таблица коэффициентов по элементам выбранного алгоритма."""

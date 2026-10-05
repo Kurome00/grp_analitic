@@ -20,11 +20,12 @@
 """
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 
 import psycopg2
 
 from core.config import DB_CONFIG
+from core.lifetimes import years_between
 
 DB_NAME = DB_CONFIG['database']
 
@@ -110,7 +111,7 @@ def grid_renew_date(install: str, step_years: int = PART_RENEW_STEP_YEARS):
     if not install:
         return None
     start = date.fromisoformat(install)
-    today = date.today()
+    today = datetime.now().date()
     renewed = None
     step = 0
     while True:
@@ -274,7 +275,7 @@ def half_year_nodes(install: str, today=None):
     if not install:
         return []
     start = date.fromisoformat(install)
-    today = today or date.today()
+    today = today or datetime.now().date()
     nodes, step = [], 1
     while True:
         node = _add_months(start, step * 6)
@@ -331,46 +332,33 @@ FAST_PART_PREFERENCES = ('мембран', 'пружин', 'седл', 'прок
                          'клапан', 'втулк', 'тарелк')
 
 
-def _schedule_fast_one(db, equipment_id: int, install: str, fast: str = None,
-                       per_cycle: int = 3) -> int:
-    """Схема fast_one: 2-3 детали обновляются планово раз в 5 лет,
-    а одна выбранная деталь меняется каждые полгода."""
-    parts = _active_replaceable_parts(db, equipment_id)
-    if not parts:
-        return 0
-
-    needles = [fast.lower()] if fast else list(FAST_PART_PREFERENCES)
-    fast_index = None
-    for needle in needles:
-        for index, (_ep_id, name) in enumerate(parts):
-            if needle and needle.lower() in name.lower():
-                fast_index = index
-                break
-        if fast_index is not None:
-            break
-    if fast_index is None:
-        fast_index = 0
-
-    grid_date = grid_renew_date(install)
+def _schedule_staggered(db, equipment_id: int, install: str) -> int:
+    """Схема staggered: все заменяемые детали заменялись в разное время.
+    Разносим замены по разным датам (раз в 6 месяцев в разные периоды) для каждой детали."""
     nodes = half_year_nodes(install)
-
-    # Плановые детали: следующие per_cycle после «быстрой».
-    for offset in range(1, per_cycle + 1):
-        index = (fast_index + offset) % len(parts)
-        if index == fast_index or not grid_date:
-            continue
-        db.update_equipment_part(parts[index][0], install_date=grid_date)
-
-    if nodes:
-        db.update_equipment_part(parts[fast_index][0], install_date=nodes[-1])
+    parts = _active_replaceable_parts(db, equipment_id)
+    if not nodes or not parts:
+        return 0
+    # Для каждой детали своя дата замены - сдвигаем по кругу
+    for i, (_ep_id, _name) in enumerate(parts):
+        # Берем узел с индексом i*2 для заметного разнесения
+        node_idx = (i * 2) % len(nodes) if len(nodes) > 0 else 0
+        if node_idx < len(nodes):
+            db.update_equipment_part(parts[i][0], install_date=nodes[node_idx])
     return len(parts)
 
 
-SCHEDULES = {
-    'grid5': _schedule_grid5,
-    'rotate': _schedule_rotate,
-    'fast_one': _schedule_fast_one,
-}
+def _schedule_staggered2(db, equipment_id: int, install: str) -> int:
+    """Схема staggered2: альтернативное разнесение деталей по времени."""
+    nodes = half_year_nodes(install)
+    parts = _active_replaceable_parts(db, equipment_id)
+    if not nodes or not parts:
+        return 0
+    for i, (_ep_id, _name) in enumerate(parts):
+        node_idx = (i * 3 + 1) % len(nodes) if len(nodes) > 0 else 0
+        if node_idx < len(nodes):
+            db.update_equipment_part(parts[i][0], install_date=nodes[node_idx])
+    return len(parts)
 
 
 def apply_schedule(db, equipment_id: int, install: str, schedule: str,
@@ -431,8 +419,8 @@ def ensure_catalog(db, from_pdf: bool = True):
     if templates or not from_pdf:
         return templates
 
-    from core.config import PROJECT_ROOT
-    pdf = os.path.join(PROJECT_ROOT, "docs", "Альбом запчастей по газу.pdf")
+    from core.config import docs_path
+    pdf = docs_path("Альбом запчастей по газу.pdf")
     if not os.path.isfile(pdf):
         print("[!] Каталог пуст, и нет docs/Альбом запчастей по газу.pdf —")
         print("    импортируйте альбом вручную: меню «Справочники» →")
@@ -456,11 +444,8 @@ def ensure_catalog(db, from_pdf: bool = True):
 
 def _actual_life(install: str, today=None) -> float:
     """Фактический срок службы: от установки до сегодняшнего дня, лет."""
-    if not install:
-        return 0.0
-    start = date.fromisoformat(install)
-    today = today or date.today()
-    return round((today - start).days / 365.25, 2)
+    value = years_between(install, today)
+    return 0.0 if value is None else round(value, 2)
 
 
 def _is_demo_scenario(grp_type: str) -> bool:
