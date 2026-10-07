@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Формирование официального отчёта по ГРП в формате Word (.docx).
+"""Word-отчёт по ГРП: сведения о ГРП и форма 6.2 расчёта остаточного ресурса.
 
-Документ оформлен по требованиям к инженерным отчётам:
-титульный лист с рамкой, содержание (автособираемое оглавление),
-автонумерация разделов, нумерованные таблицы с повторяющейся шапкой,
-колонтитул с номером страницы, подписи исполнителей и приложения.
+Отчёт — приложение к паспорту ГРП, поэтому в нём только то, что переносится в
+паспорт:
 
-Сроки элементов определяются по заменяемым запчастям: срок равен
-минимальному оставшемуся сроку службы среди них. Оборудование без
-запчастей срока не имеет. Дополнительно выполняется расчёт остаточного
-ресурса по алгоритмам 0-4 (см. модуль algorithms).
+* титульный лист;
+* раздел 1 — «Сведения о ГРП»: таблица по полям, которые пользователь ввёл в
+  карточке ГРП (см. core.grp_passport);
+* раздел 2 — форма 6.2 «Результаты расчёта остаточного ресурса» по двум
+  методикам, «Алгоритм 3» и «Алгоритм 4» окна расчёта;
+* подписи исполнителей.
+
+Форму 6.2 собирает чистая функция form62_rows: она же проверяется тестами,
+поэтому числа в отчёте не могут разойтись с тем, что пользователь видит в
+окне «Алгоритмы».
 """
-from datetime import datetime
+from datetime import date, datetime
+from typing import Dict, List, Optional
 
 from docx import Document
 from docx.enum.section import WD_ORIENT, WD_SECTION
@@ -21,24 +26,18 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
-from core.config import FULL_CHECK_TERM, REPLACEABLE_NORM_YEARS
-from core.lifetimes import years_between
-from core.models import Equipment
-from core.timefmt import years_to_text
+from core.grp_passport import report_rows
+from core.lifetimes import expiry_date, parse_date
+from core.timefmt import month_year_text
 from logic.algorithms import (
+    ALGORITHM_TITLES,
     DAMAGE_MARKERS,
-    DEADLINE_ALGORITHMS,
     FAILURE_MARKERS,
     POOR_REPAIR_MARKERS,
-    PRIMARY_ALGORITHM,
-    ALGORITHM_SOURCES,
     AlgorithmParams,
+    ElementResult,
     algo_label,
-    algo_number,
-    algo_source,
-    build_deadlines,
     calculate_all_algorithms,
-    critical_title,
     num,
 )
 
@@ -56,40 +55,17 @@ REPORT_META = {
                     'оборудования газорегуляторного пункта',
 }
 
-# Срок полной проверки оборудования ГРП. По правилу отрасли срок службы
-# элемента либо 5 лет, либо 20 лет: за пределами 20 лет эксплуатация не
-# подтверждается, так как полная проверка проводится раз в 20 лет. Значение
-# берётся из config, чтобы отчёт и расчёт пользовались одним значением, и
-# выводится в отчёте явно с пометкой источника, а не подставляется молча.
-FULL_INSPECTION_TERM = FULL_CHECK_TERM
-
 # Цветовая схема
 INK = (0, 0, 0)
 GREY = (89, 89, 89)
 RED = (176, 0, 0)
-AMBER = (191, 143, 0)
-GREEN = (0, 112, 60)
 
 FILL_HEADER = 'D9E2F3'      # шапка таблицы
-FILL_BAND = 'F2F5FA'        # чередование строк
-FILL_RED = 'FBE4E4'
-FILL_AMBER = 'FFF3DA'
-FILL_GREEN = 'E4F2E6'
-FILL_TOTAL = 'E8EDF5'
+FILL_TOTAL = 'E8EDF5'        # чередование строк
 
 BODY_FONT = 'Times New Roman'
 BODY_SIZE = 14
 TABLE_SIZE = 9
-
-
-def configure_report(organization=None, department=None, city=None,
-                     doc_code=None, report_kind=None, report_title=None):
-    """Задать реквизиты организации для титульного листа."""
-    for key, value in (('organization', organization), ('department', department),
-                       ('city', city), ('doc_code', doc_code),
-                       ('report_kind', report_kind), ('report_title', report_title)):
-        if value:
-            REPORT_META[key] = value
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +83,7 @@ def _shade(cell, fill):
 
 
 def _field(paragraph, instruction, size=BODY_SIZE, bold=False):
-    """Вставляет поле Word (PAGE, TOC, NUMPAGES)."""
+    """Вставляет поле Word (PAGE, NUMPAGES)."""
     run = paragraph.add_run()
     run.font.name = BODY_FONT
     run.font.size = Pt(size)
@@ -126,14 +102,6 @@ def _field(paragraph, instruction, size=BODY_SIZE, bold=False):
     for node in (begin, instr, separate, placeholder, end):
         run._r.append(node)
     return run
-
-
-def _update_fields_on_open(doc):
-    """Просит Word обновить оглавление при открытии файла."""
-    settings = doc.settings.element
-    flag = OxmlElement('w:updateFields')
-    flag.set(qn('w:val'), 'true')
-    settings.append(flag)
 
 
 def _page_border(section, size='12', space='24'):
@@ -167,18 +135,12 @@ def _horizontal_rule(paragraph, size='8'):
 # Разметка страницы и стили
 # ---------------------------------------------------------------------------
 
-def _setup_section(section, landscape=False):
+def _setup_section(section):
     """A4 с полями по ГОСТ: слева 30 мм, справа 15, сверху 20, снизу 20."""
-    if landscape:
-        section.orientation = WD_ORIENT.LANDSCAPE
-        section.page_width, section.page_height = Cm(29.7), Cm(21.0)
-        section.left_margin, section.right_margin = Cm(2.0), Cm(1.5)
-        section.top_margin, section.bottom_margin = Cm(1.5), Cm(1.5)
-    else:
-        section.orientation = WD_ORIENT.PORTRAIT
-        section.page_width, section.page_height = Cm(21.0), Cm(29.7)
-        section.left_margin, section.right_margin = Cm(3.0), Cm(1.5)
-        section.top_margin, section.bottom_margin = Cm(2.0), Cm(2.0)
+    section.orientation = WD_ORIENT.PORTRAIT
+    section.page_width, section.page_height = Cm(21.0), Cm(29.7)
+    section.left_margin, section.right_margin = Cm(3.0), Cm(1.5)
+    section.top_margin, section.bottom_margin = Cm(2.0), Cm(2.0)
     section.header_distance, section.footer_distance = Cm(1.0), Cm(1.0)
 
 
@@ -195,8 +157,7 @@ def _setup_styles(doc):
 
     for level, size, align, before, after in (
             (1, BODY_SIZE, WD_ALIGN_PARAGRAPH.CENTER, 18, 12),
-            (2, 13, WD_ALIGN_PARAGRAPH.LEFT, 14, 8),
-            (3, BODY_SIZE, WD_ALIGN_PARAGRAPH.LEFT, 10, 6)):
+            (2, 13, WD_ALIGN_PARAGRAPH.LEFT, 14, 8)):
         style = doc.styles[f'Heading {level}']
         style.font.name = BODY_FONT
         style.font.size = Pt(size)
@@ -242,27 +203,10 @@ def _body(doc, text, bold=False, color=INK, size=BODY_SIZE, align=None,
     return paragraph
 
 
-def _formula(doc, text):
-    """Формула методики — по центру, без отступа первой строки."""
-    return _body(doc, text, align=WD_ALIGN_PARAGRAPH.CENTER, indent=False,
-                 size=BODY_SIZE, space_after=6)
-
-
 def _note(doc, text, color=GREY, space_after=6):
     """Примечание меньшим кеглем."""
     return _body(doc, text, color=color, size=11, indent=False, italic=True,
                  space_after=space_after)
-
-
-def _bullet(doc, text, color=INK, bold=False):
-    paragraph = doc.add_paragraph(style='List Bullet')
-    run = paragraph.add_run(text)
-    run.font.name = BODY_FONT
-    run.font.size = Pt(BODY_SIZE)
-    run.font.bold = bold
-    run.font.color.rgb = RGBColor(*color)
-    paragraph.paragraph_format.space_after = Pt(4)
-    return paragraph
 
 
 def _section_title(doc, text):
@@ -328,8 +272,8 @@ def _table_caption(doc, number, title):
     return paragraph
 
 
-def _build_table(doc, headers, rows, widths, aligns=None, row_fills=None,
-                 size=TABLE_SIZE, header_size=None):
+def _build_table(doc, headers, rows, widths, aligns=None, size=TABLE_SIZE,
+                 header_size=None):
     """Таблица с повторяющейся шапкой и чередованием строк."""
     table = doc.add_table(rows=1 + len(rows), cols=len(headers))
     table.style = 'Table Grid'
@@ -343,8 +287,6 @@ def _build_table(doc, headers, rows, widths, aligns=None, row_fills=None,
 
     for row_index, row in enumerate(rows, start=1):
         fill = FILL_TOTAL if row_index % 2 == 0 else None
-        if row_fills and row_fills[row_index - 1]:
-            fill = row_fills[row_index - 1]
         for column, value in enumerate(row):
             align = (aligns[column] if aligns and column < len(aligns)
                      else WD_ALIGN_PARAGRAPH.CENTER)
@@ -357,7 +299,7 @@ def _build_table(doc, headers, rows, widths, aligns=None, row_fills=None,
 
 
 # ---------------------------------------------------------------------------
-# Титульный лист и содержание
+# Титульный лист и подписи
 # ---------------------------------------------------------------------------
 
 def _title_page(doc, grp_name, grp_id, generated_at):
@@ -434,18 +376,6 @@ def _page_footer(section):
     run.font.size = Pt(11)
 
 
-def _content_page(doc, section):
-    """Содержание с автоматическим оглавлением."""
-    _setup_section(section)
-    _page_footer(section)
-    _section_title(doc, 'СОДЕРЖАНИЕ')
-    paragraph = doc.add_paragraph()
-    paragraph.paragraph_format.first_line_indent = Cm(0)
-    _field(paragraph, r'TOC \o "1-2" \h \z \u', size=BODY_SIZE)
-    _note(doc, 'Оглавление обновляется автоматически при открытии документа '
-               '(Word: «Ссылки» → «Обновить таблицу»).')
-
-
 def _signatures(doc, generated_at):
     """Подписи исполнителей."""
     _body(doc, '', indent=False)
@@ -468,52 +398,8 @@ def _signatures(doc, generated_at):
 
 
 # ---------------------------------------------------------------------------
-# Подготовка данных
+# Подготовка данных расчёта
 # ---------------------------------------------------------------------------
-
-def _fmt(value, digits=1):
-    """Число в русской нотации."""
-    number = num(value, digits)
-    return number if number != '—' else '—'
-
-
-def _norm_cell(element):
-    """Нормативный срок службы элемента.
-
-    Если норма определена в базе — выводится она. Если данных о норме нет,
-    принимается срок полной проверки оборудования (20 лет) с явной пометкой
-    источника, чтобы принятое значение нельзя было спутать с нормативным.
-    """
-    if element.norm:
-        return years_to_text(element.norm)
-    return f'{years_to_text(FULL_INSPECTION_TERM)}*'
-
-
-def _term_source_note(element):
-    """Пометка о том, что срок принят по циклу полной проверки."""
-    if element is not None and element.norm:
-        return ''
-    return (f'* — нормативный срок в базе отсутствует; принят срок полной '
-            f'проверки оборудования — {years_to_text(FULL_INSPECTION_TERM)}. '
-            f'По истечении этого срока эксплуатация не подтверждается и '
-            f'требуется полная проверка.')
-
-
-def _effect_text(effect, equipment_name='', part_name=''):
-    """Влияние записи журнала на срок службы — текстом."""
-    if effect == 'part':
-        where = ' → '.join(x for x in (equipment_name, part_name) if x)
-        return f'срок заново: {where}' if where else 'срок детали заново'
-    if effect == 'equipment':
-        return (f'срок заново: {equipment_name} (целиком)'
-                if equipment_name else 'срок оборудования заново')
-    return '—'
-
-
-def _age_years(value):
-    """Возраст оборудования в годах от даты установки."""
-    return years_between(value)
-
 
 def _match_journal(name, journal):
     """Записи журнала замен для типа оборудования."""
@@ -525,7 +411,11 @@ def _match_journal(name, journal):
 
 
 def _load_journal(db, grp_id):
-    """Журнал замен, сгруппированный по типу оборудования."""
+    """Журнал замен, сгруппированный по типу оборудования.
+
+    Отказы, повреждения и качество ремонта из журнала — вход расчёта
+    (k_повр и K_рем), а не только украшение отчёта, поэтому читается всегда.
+    """
     journal = {}
     try:
         rows = db.get_replacements_by_grp(grp_id) or []
@@ -565,7 +455,7 @@ def _calc_inputs(db, grp_id, equipment_rows, journal):
             norm_years, removal, replaceable = part[3], part[5], part[7]
             if removal or not norm_years or float(norm_years) <= 0:
                 continue
-            details.append({'name': part[2] or 'Деталь',
+            details.append({'name': part[2] or 'Запчасть',
                             'norm_years': float(norm_years),
                             'install_date': part[4] or row[2],
                             'is_replaceable': bool(replaceable)})
@@ -584,593 +474,301 @@ def _calc_inputs(db, grp_id, equipment_rows, journal):
     return payload
 
 
-def _coefficients(db, grp_id):
-    try:
-        rows = db.get_technical_coefficients(grp_id) or []
-    except Exception:  # noqa: BLE001
-        return {}
-    if not rows:
-        return {}
-    row = list(rows[0]) + [None] * 10
-    return {'a': row[2], 'b': row[3], 'c': row[4], 'date': row[1]}
+# ---------------------------------------------------------------------------
+# Форма 6.2
+# ---------------------------------------------------------------------------
+
+# Методики, по которым печатается форма. В окне расчёта они называются
+# «Алгоритм 3» и «Алгоритм 4» (algo_label), внутри расчёта — индексы 2 и 3.
+FORM62_ALGORITHMS = (2, 3)
+
+# Категории критических элементов в порядке формы 6.2:
+# (ключ расчёта, слово в подписи, обозначение в форме).
+FORM62_CATEGORIES = (
+    ('regulator', 'регулятор', 'рег'),
+    ('pzk', 'ПЗК', 'пзк'),
+    ('psk', 'ПСК', 'пск'),
+    ('filter', 'фильтр', 'фильтр'),
+    ('valve', 'арматура', 'арматура'),
+)
+
+FORM62_KEYS = tuple(key for key, _word, _abbr in FORM62_CATEGORIES)
+
+FORM62_HEADERS = ('Параметр', 'Обозначение', 'Значение', 'Ед. изм.', 'Примечание')
+
+EMPTY = '—'
+
+
+def _usable(result) -> bool:
+    """Рассчитана ли методика: у неудачного расчёта заполнено поле error."""
+    return result is not None and not result.error
+
+
+def _trim_num(value, digits: int = 3) -> str:
+    """Число без хвостовых нулей: «2,000» → «2», «10,000» → «10».
+
+    Так печатается базовый ресурс: он приходит из норматива целым, и «2,000»
+    в форме читалось бы как измеренное значение. Нераспознанное число («—»)
+    возвращается как есть.
+    """
+    text = num(value, digits)
+    if text == EMPTY or ',' not in text:
+        return text
+    return text.rstrip('0').rstrip(',') or text
+
+
+def _z_text(value) -> str:
+    """Ресурс в годах: три знака, хвостовые нули срезаны, но не все.
+
+    «1,388» и «9,198» печатаются как есть, а «10,000» — как «10,0»: один знак
+    остаётся всегда, иначе целое терялось бы среди дробных значений колонки.
+    """
+    text = num(value, 3)
+    if text == EMPTY or ',' not in text:
+        return text
+    trimmed = text.rstrip('0')
+    return trimmed if not trimmed.endswith(',') else trimmed + '0'
+
+
+def _category_elements(result) -> Dict[str, ElementResult]:
+    """По одному элементу на категорию формы 6.2 — определяющему её ресурс.
+
+    Это элемент с наименьшим ресурсом (при равенстве — тот, чьё имя идёт
+    раньше: тот же порядок, что у слабого звена в расчёте). Минимум по этим
+    элементам равен ресурсу ГРП: в расчёт методики входят только критические
+    элементы, и каждый попадает ровно в одну категорию.
+    """
+    chosen: Dict[str, ElementResult] = {}
+    if not _usable(result):
+        return chosen
+    for element in result.elements:
+        key = element.critical_key
+        if not element.used or key not in FORM62_KEYS:
+            continue
+        current = chosen.get(key)
+        if current is None or (element.z_element, element.name) < (
+                current.z_element, current.name):
+            chosen[key] = element
+    return chosen
+
+
+def _governing(chosen: Dict[str, ElementResult]) -> Optional[ElementResult]:
+    """Элемент, задающий срок ГРП: минимум ресурса среди категорий."""
+    if not chosen:
+        return None
+    return min(chosen.values(), key=lambda e: (e.z_element, e.name))
+
+
+def _base_note(element: Optional[ElementResult]) -> str:
+    """Откуда взят базовый ресурс элемента.
+
+    ЭО — экспертная оценка. Приписка «min(Zбаза d)» ставится, когда база взята
+    минимумом по заменяемым деталям: каскад вариантов расчёта строит такую базу
+    формулой, начинающейся с «min(», и по ней это и видно.
+    """
+    if element is None:
+        return EMPTY
+    return 'ЭО min(Zбаза d)' if 'min(' in (element.z_base_formula or '') else 'ЭО'
+
+
+def _product(element: Optional[ElementResult]) -> str:
+    """Примечание к итоговому ресурсу: база и поправки произведением.
+
+    Как в самой формуле расчёта: Z = Zбаза × Kсост × Kусл × Kрем × kповр.
+    Базовый ресурс печатается без хвостовых нулей, коэффициент технического
+    состояния — тремя знаками: он считается по состоянию элемента, и «1» на
+    его месте скрывало бы, что состояние учитывалось.
+    """
+    if element is None:
+        return EMPTY
+    factors = (_trim_num(element.z_base), num(element.k_state, 3),
+               num(element.k_cond, 1), num(element.k_repair, 1),
+               num(element.k_fail, 1))
+    return ' × '.join(factors)
+
+
+def _min_note(chosen: Dict[str, ElementResult]) -> str:
+    """Примечание строки «Слабое звено»: из чего выбран минимум."""
+    values = [chosen[key].z_element for key in FORM62_KEYS if key in chosen]
+    if not values:
+        return EMPTY
+    return 'min(' + '; '.join(_z_text(value) for value in values) + ')'
+
+
+def _weak_value(result, chosen: Dict[str, ElementResult]) -> str:
+    """Слабое звено словом — категория элемента с наименьшим ресурсом."""
+    if not chosen:
+        return EMPTY
+    key = getattr(result, 'weak_element_key', None)
+    if key not in FORM62_KEYS:
+        # Категорию определяем сами: у методики слабое звено может быть не
+        # записано (например, результат собран вне расчёта).
+        key = _governing(chosen).critical_key
+    for category, word, _abbr in FORM62_CATEGORIES:
+        if category == key:
+            return word
+    return EMPTY
+
+
+def form62_rows(result, params: AlgorithmParams = None,
+                today=None) -> List[List[str]]:
+    """Строки формы 6.2 по результату одной методики.
+
+    Двадцать три строки — как в форме паспорта: базовые ресурсы, коэффициенты
+    технического состояния, общие поправки, итоговые ресурсы, слабое звено,
+    остаточный ресурс ГРП и срок следующего диагностирования. Шапку добавляет
+    таблица отчёта.
+
+    Если методика не рассчитана, строки остаются, а значения пусты: форма не
+    должна пропадать из документа — причину печатает отчёт отдельной строкой.
+    """
+    params = params or AlgorithmParams()
+    today = parse_date(today) or date.today()
+    chosen = _category_elements(result)
+    governing = _governing(chosen)
+    rows: List[List[str]] = []
+
+    # 1-5. Базовый ресурс: у элемента с деталями он взят минимумом по деталям.
+    for key, word, abbr in FORM62_CATEGORIES:
+        element = chosen.get(key)
+        rows.append([f'Базовый ресурс ({word})', f'Zбаза,{abbr}',
+                     EMPTY if element is None else _trim_num(element.z_base),
+                     'лет', _base_note(element)])
+
+    # 6-10. Коэффициент технического состояния считается по каждому элементу.
+    for key, word, abbr in FORM62_CATEGORIES:
+        element = chosen.get(key)
+        rows.append([f'Коэффициент тех. состояния ({word})', f'Kсост,{abbr}',
+                     EMPTY if element is None else num(element.k_state, 3),
+                     EMPTY, 'Из расчетов' if element is not None else EMPTY])
+
+    # 11-13. Поправки, одинаковые для всех элементов ГРП: они задаются на
+    # объект целиком, поэтому в форме стоят по одной строке, а не по категориям.
+    for label, abbr, attribute in (
+            ('Коэффициент условий эксплуатации', 'Kусл', 'k_cond'),
+            ('Коэффициент качества ремонта', 'Kрем', 'k_repair'),
+            ('Коэффициент повреждений и отказов', 'kповр', 'k_fail')):
+        rows.append([label, abbr,
+                     EMPTY if governing is None
+                     else num(getattr(governing, attribute), 1), EMPTY,
+                     'Для всех элементов' if governing is not None else EMPTY])
+
+    # 14-18. Итоговый ресурс элемента и его расчёт.
+    for key, word, abbr in FORM62_CATEGORIES:
+        element = chosen.get(key)
+        rows.append([f'Итоговый ресурс ({word})', f'Z{abbr}',
+                     EMPTY if element is None else _z_text(element.z_element),
+                     'лет', _product(element)])
+
+    # 19. Слабое звено — минимум по представителям категорий.
+    rows.append(['Слабое звено', 'Zслабое', _weak_value(result, chosen),
+                 EMPTY, _min_note(chosen)])
+
+    # 20. Остаточный ресурс ГРП — ресурс слабого звена.
+    rows.append(['Остаточный ресурс ГРП', 'ZГРП',
+                 _z_text(result.result) if _usable(result) else EMPTY, 'лет',
+                 'Ресурс слабого звена' if chosen else EMPTY])
+
+    # 21-23. Срок следующего диагностирования и его дата.
+    next_years = result.next_diagnosis if _usable(result) else None
+    months = None if next_years is None else next_years * 12
+    rows.append([
+        'Срок следующего диагностирования', 'Tслед_диагн',
+        EMPTY if next_years is None else num(next_years), 'лет',
+        EMPTY if next_years is None else
+        f'min({_z_text(result.result)} × {_trim_num(params.reserve, 2)}; '
+        f'{_trim_num(params.max_diag_interval, 1)})'])
+    rows.append([
+        'Срок следующего диагностирования', 'Tслед_диагн',
+        EMPTY if months is None else num(months, 2), 'мес.',
+        EMPTY if months is None else f'{num(next_years)} × 12'])
+    rows.append([
+        'Рекомендуемая дата следующего диагностирования', EMPTY,
+        month_year_text(expiry_date(next_years, today)), EMPTY,
+        EMPTY if months is None else
+        f'{today.strftime("%d.%m.%Y")} + {num(months, 2)} мес.'])
+    return rows
 
 
 # ---------------------------------------------------------------------------
 # Отчёт
 # ---------------------------------------------------------------------------
 
-def generate_grp_docx(db, doc_analyzer, grp_id: int, grp_name: str,
-                      filename: str = None, params: AlgorithmParams = None,
-                      coefficients: dict = None) -> str:
-    """Сформировать официальный Word-отчёт по конкретному ГРП.
+def generate_grp_docx(db, grp_id: int, grp_name: str, filename: str = None,
+                      params: AlgorithmParams = None) -> str:
+    """Сформировать Word-отчёт по конкретному ГРП.
 
     params — весовые коэффициенты алгоритмов. Если не переданы, берутся
     рекомендуемые значения методики (AlgorithmParams по умолчанию).
-    Вызывающий код обязан передавать те же параметры, что и в окно расчётов,
+    Вызывающий код должен передавать те же параметры, что и в окно расчётов,
     иначе отчёт разойдётся с тем, что пользователь видел на экране.
-
-    coefficients — техкоэффициенты A/B/C/K; по умолчанию читаются из БД.
 
     Возвращает путь к сохранённому файлу .docx.
     """
     generated_at = datetime.now()
+    # Запасной кортеж короткий: сведения паспорта из него пусты, и таблица
+    # «Сведения о ГРП» напечатает прочерки вместо падения.
     grp = db.get_grp_by_id(grp_id) or (grp_id, grp_name, 0, 0, 0)
-    equipment_rows = db.get_equipment_by_grp(grp_id) or []
-    equipment_list = [
-        Equipment(name=e[1], install_date=e[2], removal_date=e[3], id=e[0])
-        for e in equipment_rows
-    ]
-    analysis = doc_analyzer.analyze_grp_equipment(equipment_list)
-    current = analysis['current']
-    stats = current['statistics']
-    # Подробная выборка нужна для графы «Влияние на срок»; при её отсутствии
-    # отчёт собирается из обычного журнала и показывает «—».
-    try:
-        replacements = db.get_replacements_detailed(grp_id) or []
-    except AttributeError:
-        replacements = db.get_replacements_by_grp(grp_id) or []
-
-    journal = _load_journal(db, grp_id)
-    if coefficients is None:
-        coefficients = _coefficients(db, grp_id)
     if params is None:
         params = AlgorithmParams()
-    results = calculate_all_algorithms(_calc_inputs(db, grp_id, equipment_rows, journal),
-                                       params=params, coefficients=coefficients)
-    primary = results[PRIMARY_ALGORITHM]
-    usable = [r for r in results.values() if not r.error]
-    # Два срока — по методикам 3 и 4 — плюс слабые звенья каждого.
-    deadlines = build_deadlines(results)
+
+    equipment_rows = db.get_equipment_by_grp(grp_id) or []
+    journal = _load_journal(db, grp_id)
+    results = calculate_all_algorithms(
+        _calc_inputs(db, grp_id, equipment_rows, journal), params=params)
 
     doc = Document()
     _setup_styles(doc)
-    _update_fields_on_open(doc)
 
     # --- Титульный лист ---------------------------------------------------
     _title_page(doc, grp_name, grp_id, generated_at)
 
     # Разрыв раздела сам начинает новую страницу — лишний разрыв страницы
     # здесь создавал бы пустой лист.
-    content_section = doc.add_section(WD_SECTION.NEW_PAGE)
-    _content_page(doc, content_section)
-    doc.add_page_break()
+    body_section = doc.add_section(WD_SECTION.NEW_PAGE)
+    _setup_section(body_section)
+    _page_footer(body_section)
 
-    table_number = 0
-
-    def caption(title):
-        nonlocal table_number
-        table_number += 1
-        _table_caption(doc, table_number, title)
-
-    # --- 1. Общие сведения ------------------------------------------------
-    _section_title(doc, '1 ОБЩИЕ СВЕДЕНИЯ')
-    _body(doc, 'Настоящий отчёт содержит результаты оценки остаточного ресурса '
-               f'оборудования газорегуляторного пункта «{grp_name}» и предназначен '
-               'для планирования технического обслуживания, диагностирования и '
-               'замены оборудования.', space_after=8)
-
-    caption('Параметры газорегуляторного пункта')
-    _build_table(doc, ['Показатель', 'Значение'], [
-        ['Тип газорегуляторного пункта', grp[1]],
-        ['Количество ниток', _fmt(grp[2], 0)],
-        ['Фактический срок службы', years_to_text(grp[3])],
-        ['Проектный срок службы', years_to_text(grp[4])],
-        ['Оборудования в эксплуатации, ед.', _fmt(stats['total'], 0)],
-        ['Замен запчастей по журналу, ед.', _fmt(len(replacements), 0)],
-    ], widths=[8.0, 7.5], aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER],
-        size=11)
+    # --- 1. Сведения о ГРП -------------------------------------------------
+    _section_title(doc, '1 СВЕДЕНИЯ О ГРП')
+    _table_caption(doc, 1, 'Сведения о газорегуляторном пункте')
+    _build_table(doc, ['Показатель', 'Значение'], report_rows(grp),
+                 widths=[7.0, 9.5],
+                 aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+                 size=11)
     _body(doc, '', indent=False, space_after=6)
 
-    # --- 2. Методика -------------------------------------------------------
-    _section_title(doc, '2 МЕТОДИКА РАСЧЁТА')
-    _body(doc, f'Расчёт выполнен по {algo_label(PRIMARY_ALGORITHM)} — скорректированной '
-               'редакции методики оценки остаточного ресурса элементов ГРП. '
-               'Оценка производится в два этапа: '
-               'определяется базовый ресурс элемента, затем применяются '
-               'поправочные коэффициенты. Итог по ГРП определяется по принципу '
-               'слабого звена — минимальному ресурсу среди критических элементов. '
-               'Для сравнения в разделе 3 приведён также результат '
-               f'{algo_label(DEADLINE_ALGORITHMS[1])} — он считает другую величину '
-               '(срок до полной проверки оборудования), поэтому сводить их в одно '
-               'значение нельзя.',
-           space_after=4)
-    _note(doc, 'Нумерация методик в приложении (1-5) не совпадает с нумерацией '
-               'исходных документов. Соответствие: ' + '; '.join(
-                   f'{algo_label(n)} — {algo_source(n)}' for n in sorted(ALGORITHM_SOURCES)
-               ) + '.', space_after=8)
+    # --- 2. Форма 6.2 ------------------------------------------------------
+    _section_title(doc, '2 РЕЗУЛЬТАТЫ РАСЧЁТА ОСТАТОЧНОГО РЕСУРСА')
+    _body(doc, 'Результаты расчёта приведены по форме 6.2 для двух методик — '
+               f'{algo_label(FORM62_ALGORITHMS[0])} и '
+               f'{algo_label(FORM62_ALGORITHMS[1])}. Остаточный ресурс ГРП '
+               'определён по слабому звену — минимальному ресурсу среди '
+               'критических элементов.', space_after=6)
 
-    doc.add_heading('2.1 Базовый ресурс элемента', level=2)
-    _body(doc, 'Базовый ресурс определяется каскадом оценок; применяется первый '
-               'доступный вариант:', space_after=4)
-    _bullet(doc, 'вариант А — по фактической наработке (телеметрия): '
-                 'Z = (Sнач − Sфакт) / Sнач · Sнач;')
-    _bullet(doc, 'вариант Б1 — по протоколу диагностики: Zд = Kсост,д · Sнач,д;')
-    _bullet(doc, 'вариант Б2 — документальная (экспертная) оценка: '
-                 'Zд = Sнач,д − Sфакт,д;')
-    _bullet(doc, 'вариант В — календарный (резервный) при отсутствии сведений '
-                 'о деталях: Z = Sнач − Sфакт.')
-    _body(doc, 'Ресурс элемента принимается равным минимуму по его деталям, то есть '
-               'определяется слабейшей деталью.', space_after=6)
-
-    doc.add_heading('2.2 Поправочные коэффициенты', level=2)
-    _formula(doc, 'Zэл = Zбаза · Kсост · Kэксл · Kрем · kповр')
-    _formula(doc, 'Kсост = 1 − (1/n) · Σ |Δij| / Допускij')
-    _formula(doc, 'Kэксл = 1 − θ · (1 − Услфакт / Услнорм)')
-    _formula(doc, 'kповр = max(0; 1 − α · Nотказ − β · Nповрежд)')
-    _body(doc, 'При отсутствии данных соответствующий коэффициент принимается равным '
-               'единице; факт отсутствия данных фиксируется в отчёте.', space_after=8)
-
-    doc.add_heading('2.3 Итог по ГРП и срок диагностирования', level=2)
-    _formula(doc, 'ZГРП = min (Zрег; Zпзк; Zпск; Zфильтр; Zарматура)')
-    _formula(doc, 'Tдиагн = min (ZГРП · Kзапаса ; Tмакс)')
-    _body(doc, '', indent=False, space_after=4)
-
-    caption('Принятые весовые коэффициенты')
-    coefficient_rows = [list(row) for row in params.as_rows()]
-    _build_table(doc, ['Параметр', 'Значение', 'Диапазон', 'Назначение'],
-                 coefficient_rows, widths=[3.6, 1.8, 2.0, 8.1],
-                 aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
-                         WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
-                 size=10)
-    if params is not None and params != AlgorithmParams():
-        _note(doc, 'Применены весовые коэффициенты, заданные в окне расчёта; '
-                   'они отличаются от рекомендуемых методикой значений по умолчанию.')
-    else:
-        _note(doc, 'Значения приведены по рекомендациям методики и подлежат уточнению '
-                   'по результатам эксплуатации конкретного объекта.')
-    _body(doc, '', indent=False, space_after=6)
-
-    # --- 3. Результаты расчёта --------------------------------------------
-    _section_title(doc, '3 РЕЗУЛЬТАТЫ РАСЧЁТА ОСТАТОЧНОГО РЕСУРСА')
-    if usable:
-        _body(doc, 'Остаточный ресурс ГРП «' + grp_name + '» определён раздельно '
-                   'по двум методикам. Оба срока приведены независимо, '
-                   'сведение в одну величину не выполняется.', space_after=6)
-        deadline_rows, deadline_fills = [], []
-        for dl in deadlines:
-            if dl.error:
-                deadline_rows.append([f'{algo_label(dl.algorithm_number)} — {dl.algorithm_name}',
-                                      '—', '—', dl.error])
-                deadline_fills.append(FILL_TOTAL)
-                continue
-            deadline_rows.append([
-                f'{algo_label(dl.algorithm_number)} — {dl.algorithm_name}',
-                years_to_text(dl.result),
-                years_to_text(dl.next_diagnosis),
-                f'{len(dl.weak_links)}',
-            ])
-            deadline_fills.append(FILL_TOTAL if dl.result <= 0 else None)
-        _build_table(doc, ['Методика', 'Остаточный ресурс', 'Срок диагностирования',
-                           'Слабых звеньев'],
-                     deadline_rows, widths=[6.4, 3.4, 3.4, 2.3],
-                     aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER],
-                     row_fills=deadline_fills, size=10)
-        _body(doc, '', indent=False, space_after=6)
-        _note(doc, 'Срок диагностирования T_диагн = min(Z_ГРП × K_запаса; T_макс). '
-                   'Расчёт выполнен по заменяемым деталям (расходным), имеющим '
-                   f'срок службы {REPLACEABLE_NORM_YEARS:g} лет.')
-        _body(doc, '', indent=False, space_after=6)
-    else:
-        _body(doc, 'Расчёт остаточного ресурса не выполнен: '
-                   f'{primary.error or "нет исходных данных"}.', bold=True,
-               color=RED, space_after=8)
-
-    caption('Сравнение результатов по методикам')
-    comparison_rows, fills = [], []
-    for number, result in sorted(results.items()):
-        if result.error:
-            comparison_rows.append([f'{algo_label(number)} — {result.algorithm_name}',
-                                    '—', '—', result.error])
-            fills.append(FILL_TOTAL)
-            continue
-        comparison_rows.append([
-            f'{algo_label(number)} — {result.algorithm_name}'
-            + (' (основной)' if number in DEADLINE_ALGORITHMS else ''),
-            years_to_text(result.result),
-            years_to_text(result.next_diagnosis),
-            result.weak_element or '—',
-        ])
-        fills.append(FILL_TOTAL if number in DEADLINE_ALGORITHMS else None)
-    _build_table(doc, ['Методика', 'Остаточный ресурс', 'Срок диагностирования',
-                       'Слабое звено'],
-                 comparison_rows, widths=[5.6, 3.2, 3.2, 3.5],
-                 aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
-                         WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
-                 row_fills=fills, size=10)
-    _body(doc, '', indent=False, space_after=6)
-
-    if usable:
-        _body(doc, '', indent=False, space_after=6)
-        _section_title(doc, '3.1 СЛАБЫЕ ЗВЕНЬЯ')
-        _body(doc, 'Слабое звено — элемент с наименьшим остаточным ресурсом; именно '
-                   'он ограничивает ресурс ГРП. Ниже перечислены все элементы, '
-                   'чьи ресурсы совпадают с минимумом (в пределах полугода), '
-                   'с указанием заменяемой детали, определившей их состояние.',
-               space_after=8)
-        for dl in deadlines:
-            if dl.error:
-                continue
-            heading = (f'{algo_label(dl.algorithm_number)} — {dl.algorithm_name}: '
-                       f'слабых звеньев — {len(dl.weak_links)}')
-            _body(doc, heading, bold=True, space_after=4)
-            if not dl.weak_links:
-                _body(doc, 'Слабые звенья не определены: в расчёт не вошёл ни один '
-                           'критический элемент с заменяемыми деталями.', size=12,
-                       space_after=8)
-                continue
-            weak_rows = []
-            for link in dl.weak_links:
-                weak_rows.append([
-                    link.element,
-                    link.category,
-                    years_to_text(link.z_element),
-                    link.part or '—',
-                    years_to_text(link.part_norm) if link.part_norm else '—',
-                    years_to_text(link.part_age) if link.part_age is not None else '—',
-                ])
-            _build_table(doc, ['Элемент ГРП', 'Категория', 'Ресурс элемента',
-                               'Определяющая деталь', 'S нач детали', 'Возраст детали'],
-                         weak_rows, widths=[4.2, 2.8, 2.2, 3.4, 1.8, 1.8],
-                         aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
-                                 WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT,
-                                 WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER],
-                         size=9)
-            _body(doc, '', indent=False, space_after=6)
-            if dl.recommendation:
-                _body(doc, f'Рекомендация по методике '
-                            f'{algo_number(dl.algorithm_number)}: '
-                            f'{dl.recommendation}', size=12, space_after=8)
-
-    # --- 4. Поэлементный расчёт -------------------------------------------
-    _section_title(doc, '4 ПОЭЛЕМЕНТНЫЙ РАСЧЁТ')
-    _body(doc, 'В расчёт включены критические элементы ГРП. Для каждого приведены '
-               'нормативный ресурс, фактический возраст, базовый ресурс с указанием '
-               'применённого варианта оценки и итоговые поправки.', space_after=8)
-
-    element_rows, element_fills = [], []
-    weak_name = primary.weak_element
-    for element in primary.elements:
-        if not element.used:
-            # Элемент исключён из итога (например, не является критическим),
-            # но его норма, возраст и базовый ресурс движок уже посчитал —
-            # показываем их, чтобы данные не терялись. Поправочные
-            # коэффициенты и итоговый ресурс не применяются.
-            element_rows.append([
-                element.name,
-                'не входит в расчёт: ' + element.skip_reason,
-                _norm_cell(element),
-                years_to_text(element.age),
-                f'{years_to_text(element.z_base)} ({element.z_base_variant or "—"})',
-                '—', '—', '—', '—', '—'])
-            element_fills.append(FILL_BAND)
-            continue
-        element_rows.append([
-            element.name,
-            critical_title(element.critical_key) if element.critical_key else '—',
-            _norm_cell(element),
-            years_to_text(element.age),
-            f'{years_to_text(element.z_base)} ({element.z_base_variant or "—"})',
-            _fmt(element.k_state, 3),
-            _fmt(element.k_cond, 3),
-            _fmt(element.k_repair, 3),
-            _fmt(element.k_fail, 3),
-            years_to_text(element.z_element),
-        ])
-        element_fills.append(FILL_RED if element.name == weak_name
-                             else (FILL_AMBER if element.z_element <= 0 else None))
-    if primary.elements:
-        _build_table(doc, ['Элемент', 'Категория', 'S нач', 'Возраст',
-                           'Z база', 'K сост', 'K эксл', 'K рем', 'k повр',
-                           'Z эл'],
-                     element_rows,
-                     widths=[3.4, 2.4, 1.5, 1.6, 2.0, 1.1, 1.1, 1.1, 1.1, 1.4],
-                     row_fills=element_fills, size=8)
-        _note(doc, 'Выделенная строка — слабое звено, определяющее итог по ГРП. '
-                   'Здесь и далее: Zбаза — базовый ресурс в варианте оценки '
-                   'А/Б1/Б2/В, Zэл — ресурс с учётом всех поправок. Для элементов, '
-                   'не вошедших в итог, показываются норма, возраст и базовый '
-                   'ресурс; поправочные коэффициенты к ним не применяются, поэтому '
-                   'Zэл по ним не рассчитывается.')
-        if any(not element.norm for element in primary.elements):
-            _note(doc, _term_source_note(next(
-                element for element in primary.elements
-                if not element.norm)), color=AMBER)
-    else:
-        # Нормативный срок не определён ни для одного элемента: расчёт
-        # остаточного ресурса не выполняется. Чтобы отчёт не оставался
-        # пустым, по каждой позиции показывается принятый срок полной
-        # проверки оборудования, а незнание нормы отражается явно.
-        _note(doc, f'Расчёт остаточного ресурса не выполнен: {primary.error}. '
-                   f'Для контроля срока эксплуатации по перечисленным позициям '
-                   f'принят срок полной проверки оборудования — '
-                   f'{years_to_text(FULL_INSPECTION_TERM)}.', color=AMBER)
-        fallback_rows, fallback_fills = [], []
-        for row in equipment_rows:
-            row = list(row) + [None] * 4
-            if row[3]:
-                continue
-            fallback_rows.append([
-                row[1] or 'Без названия', row[2] or '—',
-                f'{years_to_text(FULL_INSPECTION_TERM)}*',
-                years_to_text(_age_years(row[2])), '—', '—', '—', '—', '—', '—'])
-            fallback_fills.append(FILL_AMBER)
-        if fallback_rows:
-            caption('Принятые сроки службы при отсутствии нормативов')
-            _build_table(doc, ['Элемент', 'Дата установки', 'S нач',
-                               'Возраст', 'Z база', 'K сост',
-                               'K эксл', 'K рем', 'k повр', 'Z эл'],
-                         fallback_rows,
-                         widths=[3.4, 2.2, 1.5, 1.6, 2.0, 1.1, 1.1, 1.1, 1.1, 1.4],
-                         row_fills=fallback_fills, size=8)
-            _note(doc, _term_source_note(None), color=AMBER)
-    _body(doc, '', indent=False, space_after=6)
-
-    # --- 5. Сводка состояния ----------------------------------------------
-    _section_title(doc, '5 СВОДКА СОСТОЯНИЯ ОБОРУДОВАНИЯ')
-    caption('Распределение оборудования по остатку срока службы')
-    summary_rows = [
-        ['Всего в эксплуатации', _fmt(stats['total'], 0), FILL_TOTAL],
-        ['Срок истёк — требуется замена', _fmt(stats['exceeded_count'], 0), FILL_RED],
-        ['Осталось менее года', _fmt(stats['warning_count'], 0), FILL_AMBER],
-        ['В пределах срока', _fmt(stats['normal_count'], 0), FILL_GREEN],
-        ['Без сведений о запчастях', _fmt(stats['no_norm_count'], 0), None],
-    ]
-    _build_table(doc, ['Категория состояния', 'Количество, ед.'],
-                 [[row[0], row[1]] for row in summary_rows],
-                 widths=[11.0, 4.5],
-                 aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER],
-                 row_fills=[row[2] for row in summary_rows], size=11)
-    _body(doc, '', indent=False, space_after=6)
-
-    # --- 6. Оборудование с истёкшим сроком --------------------------------
-    _section_title(doc, '6 ОБОРУДОВАНИЕ С ИСТЁКШИМ СРОКОМ СЛУЖБЫ')
-    if current['exceeded']:
-        rows, fills = [], []
-        for item in current['exceeded']:
-            rows.append([item['name'], item['install_date'] or '—',
-                         years_to_text(item['age_years']),
-                         years_to_text(-item['remaining']),
-                         years_to_text(item['exceeded_years'])])
-            fills.append(FILL_RED)
-        caption('Оборудование, срок службы которого истёк')
-        _build_table(doc, ['Оборудование', 'Дата установки', 'Возраст',
-                           'Остаток', 'Просрочено'],
-                     rows, widths=[5.0, 2.4, 2.2, 2.2, 3.7],
+    for index, number in enumerate(FORM62_ALGORITHMS, start=1):
+        result = results.get(number)
+        doc.add_heading(f'2.{index} {algo_label(number)} — '
+                        f'{ALGORITHM_TITLES.get(number, "")}', level=2)
+        if not _usable(result):
+            _note(doc, 'Расчёт по этой методике не выполнен: '
+                       f'{result.error if result else "методика не рассчитана"}.',
+                  color=RED)
+        _table_caption(doc, 1 + index,
+                       f'Результаты расчёта остаточного ресурса '
+                       f'({algo_label(number)})')
+        _build_table(doc, list(FORM62_HEADERS),
+                     form62_rows(result, params, generated_at),
+                     widths=[5.5, 2.6, 2.0, 1.4, 5.0],
                      aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
                              WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.CENTER],
-                     row_fills=fills, size=10)
-        _body(doc, '', indent=False, space_after=6)
-        _body(doc, 'По результатам оценки требуется замена перечисленного '
-                   'оборудования. Наименее приоритетным является элемент с наибольшей '
-                   'просрочкой.', space_after=6)
-    else:
-        _body(doc, 'Оборудования с истёкшим сроком службы не выявлено.',
-              color=GREEN, space_after=6)
-
-    # --- 7. Требующее внимания -------------------------------------------
-    _section_title(doc, '7 ОБОРУДОВАНИЕ, ТРЕБУЮЩЕЕ ВНИМАНИЯ')
-    if current['warning']:
-        rows, fills = [], []
-        for item in current['warning']:
-            rows.append([item['name'], item['install_date'] or '—',
-                         years_to_text(item['left_years'])])
-            fills.append(FILL_AMBER)
-        caption('Оборудование с остатком срока менее года')
-        _build_table(doc, ['Оборудование', 'Дата установки', 'Остаточный срок'],
-                     rows, widths=[6.4, 3.2, 3.9],
-                     aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.CENTER],
-                     row_fills=fills, size=10)
-        _body(doc, '', indent=False, space_after=6)
-        _body(doc, 'Замену перечисленного оборудования следует запланировать '
-                   'в пределах ближайшего года.', space_after=6)
-    else:
-        _body(doc, 'Оборудования с остатком срока менее года не выявлено.',
-              color=GREEN, space_after=6)
-
-    # --- 8. В пределах срока ----------------------------------------------
-    _section_title(doc, '8 ОБОРУДОВАНИЕ В ПРЕДЕЛАХ СРОКА СЛУЖБЫ')
-    if current['normal']:
-        caption('Оборудование, эксплуатация которого продолжается')
-        _build_table(doc, ['Оборудование', 'Дата установки', 'Остаточный срок'],
-                     [[item['name'], item['install_date'] or '—',
-                       years_to_text(item['left_years'])] for item in current['normal']],
-                     widths=[7.0, 3.0, 3.5],
-                     aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.CENTER], size=10)
-        _body(doc, '', indent=False, space_after=6)
-    else:
-        _body(doc, 'Оборудования в пределах срока нет.', color=GREEN, space_after=6)
-
-    # --- 9. Без сведений о запчастях -------------------------------------
-    _section_title(doc, '9 ОБОРУДОВАНИЕ БЕЗ СВЕДЕНИЙ О ЗАПЧАСТЯХ')
-    if current['no_norm']:
-        caption('Оборудование, для которого нормативный срок в базе отсутствует')
-        _build_table(doc, ['Оборудование', 'Дата установки',
-                           'Принятый срок', 'Мероприятие'],
-                     [[item['name'], item['install_date'] or '—',
-                       years_to_text(FULL_INSPECTION_TERM),
-                       'Внести состав запчастей и нормы']
-                      for item in current['no_norm']],
-                     widths=[5.2, 2.4, 2.4, 5.5],
-                     aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.LEFT], row_fills=[FILL_AMBER] *
-                      len(current['no_norm']), size=10)
-        _body(doc, '', indent=False, space_after=6)
-        _body(doc, f'Нормативные сроки по указанным позициям в базе отсутствуют, '
-                   f'поэтому для контроля принят срок полной проверки оборудования '
-                   f'— {years_to_text(FULL_INSPECTION_TERM)}. По истечении этого срока '
-                   f'эксплуатация не подтверждается. Детальный расчёт остаточного '
-                   f'ресурса выполняется после внесения состава запчастей и норм.',
-              space_after=6)
-    else:
-        _body(doc, 'Оборудования без сведений о запчастях нет.', color=GREEN,
-              space_after=6)
-
-    # --- 10. История замен оборудования -----------------------------------
-    section_number = 10
-    if analysis['history']['removed_count'] > 0:
-        _section_title(doc, f'{section_number} ИСТОРИЯ ЗАМЕН ОБОРУДОВАНИЯ')
-        history_rows = []
-        for equip_type, records in analysis['history']['replacement_history'].items():
-            for record in records:
-                history_rows.append([
-                    equip_type, record['install_date'] or '—',
-                    record['removal_date'] or '—',
-                    years_to_text(record['lifetime_years'])])
-        caption('Демонтированное и заменённое оборудование')
-        _build_table(doc, ['Тип оборудования', 'Установлено', 'Демонтировано',
-                           'Время жизни'],
-                     history_rows, widths=[5.4, 3.0, 3.0, 4.1],
-                     aligns=[WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER],
-                     size=10)
-        _body(doc, '', indent=False, space_after=6)
-        section_number += 1
-
-    # --- Журнал замен запчастей (альбомная ориентация) --------------------
-    # Разрыв раздела ставится до заголовка, иначе заголовок и таблица
-    # оказались бы на разных страницах.
-    if replacements:
-        landscape = doc.add_section(WD_SECTION.NEW_PAGE)
-        _setup_section(landscape, landscape=True)
-        _page_footer(landscape)
-
-    _section_title(doc, f'{section_number} ЖУРНАЛ ЗАМЕН ЗАПЧАСТЕЙ')
-    section_number += 1
-    if replacements:
-        _body(doc, f'По ГРП «{grp_name}» зафиксировано записей: '
-                   f'{len(replacements)}.', space_after=6)
-    else:
-        _body(doc, 'Замен запчастей по данному ГРП не зафиксировано.', space_after=6)
-
-    if replacements:
-        caption('Журнал замен запчастей')
-        # Подробная выборка, если она доступна: добавляет графу о влиянии
-        # записи на срок службы (сброс срока детали или оборудования).
-        detailed = None
-        try:
-            detailed = replacements
-            rows = [[str(index), record[1] or '—', record[2] or '—',
-                     record[3] or '—', record[4] or '—', record[5] or '—',
-                     record[6] or '—', record[7] or '—', record[8] or '—',
-                     _effect_text(record[11], record[13], record[14])]
-                    for index, record in enumerate(detailed, start=1)]
-        except (IndexError, TypeError):
-            rows = [[str(index), record[1] or '—', record[2] or '—',
-                     record[3] or '—', record[4] or '—', record[5] or '—',
-                     record[6] or '—', record[7] or '—', record[8] or '—', '—']
-                    for index, record in enumerate(replacements, start=1)]
-        _build_table(doc,
-                     ['№', 'Дата', 'Номер запчасти', 'Тип оборудования', 'Модель',
-                      'Производитель', 'Вид работ', 'Причина', 'Ответственный',
-                      'Влияние на срок'],
-                     rows,
-                     widths=[0.8, 1.9, 2.4, 3.0, 2.1, 2.4, 2.3, 3.8, 2.8, 3.5],
-                     aligns=[WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER,
-                             WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
-                             WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
-                             WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT,
-                             WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+                             WD_ALIGN_PARAGRAPH.LEFT],
                      size=9)
-
-    # Возврат в книжную ориентацию
-    portrait = doc.add_section(WD_SECTION.NEW_PAGE)
-    _setup_section(portrait)
-    _page_footer(portrait)
-
-    # --- Выводы ------------------------------------------------------------
-    _section_title(doc, f'{section_number} ВЫВОДЫ И РЕКОМЕНДАЦИИ')
-    section_number += 1
-
-    conclusions = []
-    if stats['exceeded_count'] > 0:
-        conclusions.append(
-            (RED, f'Требуется немедленная замена {stats["exceeded_count"]} ед. '
-                  f'оборудования — срок службы установленных деталей истёк.'))
-    if stats['warning_count'] > 0:
-        conclusions.append(
-            (AMBER, f'Замену {stats["warning_count"]} ед. оборудования следует '
-                    f'запланировать в течение ближайшего года.'))
-    if stats['no_norm_count'] > 0:
-        conclusions.append(
-            (GREY, f'По {stats["no_norm_count"]} ед. оборудования отсутствуют сведения '
-                    f'о составе и нормах — необходимо их внести.'))
-    if usable:
-        conclusions.append(
-            (INK, f'Плановый срок диагностирования по основной методике — '
-                  f'{years_to_text(primary.next_diagnosis)} '
-                  f'(не позднее {years_to_text(params.max_diag_interval)}).'))
-    if not conclusions:
-        conclusions.append((GREEN, 'Оборудование ГРП находится в пределах '
-                                   'нормативного срока службы.'))
-
-    for color, text in conclusions:
-        _body(doc, text, bold=color != GREY, color=color, space_after=6)
-
-    if usable:
         _body(doc, '', indent=False, space_after=6)
-        _signatures(doc, generated_at)
-        _body(doc, '', indent=False, space_after=6)
-        _note(doc, f'Отчёт сформирован автоматически '
-                   f'{generated_at.strftime("%d.%m.%Y в %H:%M")} '
-                   f'по данным информационной системы учёта газорегуляторных пунктов. '
-                   f'Идентификатор объекта: {grp_id}.')
 
-    # --- Приложение А. Трассировка ----------------------------------------
-    doc.add_page_break()
-    doc.add_heading('ПРИЛОЖЕНИЕ А', level=1)
-    _body(doc, '(справочное) Пошаговая трассировка расчёта остаточного ресурса '
-               'по основной методике', bold=True, align=WD_ALIGN_PARAGRAPH.CENTER,
-          indent=False, space_after=8)
-
-    _table_caption(doc, table_number + 1, 'Последовательность вычислений')
-    trace_table = doc.add_table(rows=1, cols=2)
-    trace_table.style = 'Table Grid'
-    _cell_text(trace_table.rows[0].cells[0], 'Шаг', bold=True, size=10,
-               fill=FILL_HEADER)
-    _cell_text(trace_table.rows[0].cells[1], 'Вычисление', bold=True, size=10,
-               fill=FILL_HEADER)
-    _repeat_header(trace_table.rows[0])
-    for step in primary.steps:
-        if not step.text.strip():
-            continue
-        row = trace_table.add_row()
-        level = step.level
-        _cell_text(row.cells[0], {'title': 'Заголовок', 'formula': 'Формула',
-                                  'value': 'Значение', 'note': 'Примечание',
-                                  'warn': 'Внимание'}.get(level, 'Значение'),
-                   size=9, color=GREY)
-        color = RED if level == 'warn' else INK
-        _cell_text(row.cells[1], step.text.strip(), size=9,
-                   align=WD_ALIGN_PARAGRAPH.LEFT,
-                   bold=level in ('title', 'formula'), color=color)
-    _fix_widths(trace_table, [3.0, 12.5])
+    _signatures(doc, generated_at)
 
     if not filename:
-        filename = f'otchet_grp_{grp_id}_{generated_at.strftime("%Y%m%d")}.docx'
+        filename = f'Отчёт_ГРП_{grp_id}_{generated_at:%Y%m%d}.docx'
     doc.save(filename)
     return filename

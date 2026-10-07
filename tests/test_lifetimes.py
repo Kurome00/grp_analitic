@@ -15,7 +15,8 @@
 import os
 import sys
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +27,7 @@ from core.lifetimes import (  # noqa: E402
     age_years,
     default_norm,
     driving_parts_remaining,
+    expiry_date,
     is_replaceable,
     lifetime_months,
     norm_for_name,
@@ -133,6 +135,29 @@ class ExpiryTests(unittest.TestCase):
         self.assertIsNone(add_years(None, 5.0))
 
 
+class ExpiryDateTests(unittest.TestCase):
+    """Остаток лет → дата: одно правило на интерфейс и на ядро расчёта."""
+
+    def test_days_are_rounded_not_truncated(self):
+        """Колонка «Истекает» в интерфейсе и сравнение сроков в ядре совпадают."""
+        self.assertEqual(expiry_date(2.0, today='2024-01-01'),
+                         date(2024, 1, 1) + timedelta(days=round(2.0 * DAYS_IN_YEAR)))
+
+    def test_less_than_a_day_gives_the_same_date(self):
+        """По этой дате ядро решает, что сроки элементов совпали."""
+        base = expiry_date(4.0, today='2024-01-01')
+        self.assertEqual(expiry_date(4.0 + 0.4 / DAYS_IN_YEAR, today='2024-01-01'), base)
+        self.assertNotEqual(expiry_date(4.0 + 0.6 / DAYS_IN_YEAR, today='2024-01-01'),
+                            base)
+
+    def test_today_defaults_to_now(self):
+        self.assertEqual(expiry_date(0.0), date.today())
+
+    def test_unknown_remainder_has_no_date(self):
+        self.assertIsNone(expiry_date(None))
+        self.assertIsNone(expiry_date('мусор'))
+
+
 class MonthsTests(unittest.TestCase):
     def test_calendar_month_year_is_close_to_twelve(self):
         value = lifetime_months('2020-01-01', '2021-01-01')
@@ -227,6 +252,44 @@ class DrivingPartsTests(unittest.TestCase):
     def test_no_parts_is_empty(self):
         self.assertEqual(driving_parts_remaining([]), [])
         self.assertEqual(driving_parts_remaining(None), [])
+
+
+class DatabaseNormTests(unittest.TestCase):
+    """Норма из БД приходит decimal.Decimal (колонка объявлена DECIMAL), а не float.
+
+    Регрессия, которую эти тесты держат: `норма * DAYS_IN_YEAR` с Decimal
+    падает с TypeError, поэтому интерфейс срок показывал (он приводил норму к
+    float сам), а Word-отчёт на той же детали не создавался вовсе.
+    """
+
+    def test_add_years_accepts_decimal_norm(self):
+        self.assertEqual(add_years('2020-06-01', Decimal('5.00')),
+                         add_years('2020-06-01', 5.0))
+
+    def test_add_years_reports_unparsable_norm_as_none(self):
+        self.assertIsNone(add_years('2020-06-01', 'мусор'))
+        self.assertIsNone(add_years('2020-06-01', None))
+
+    def test_remaining_years_accepts_decimal_norm(self):
+        self.assertAlmostEqual(
+            remaining_years('2023-01-01', Decimal('5.00'), today='2024-01-01'),
+            remaining_years('2023-01-01', 5.0, today='2024-01-01'), places=9)
+
+    def test_part_remaining_accepts_decimal_norm(self):
+        self.assertAlmostEqual(
+            part_remaining('2023-01-01', None, Decimal('5.00'), today='2024-01-01'),
+            5.0 - years_between('2023-01-01', '2024-01-01'), places=9)
+
+    def test_driving_parts_remaining_accepts_decimal_norm(self):
+        """Строка в том виде, в каком её отдаёт get_equipment_parts_full."""
+        parts = [(1, 1, 'Мембрана', Decimal('5.00'), '2023-01-01', None, None, True)]
+        value = min(driving_parts_remaining(parts, today='2024-01-01'))
+        self.assertAlmostEqual(value, remaining_years('2023-01-01', 5.0,
+                                                      today='2024-01-01'), places=9)
+
+    def test_is_replaceable_accepts_decimal_norm(self):
+        self.assertTrue(is_replaceable(Decimal('5.00')))
+        self.assertFalse(is_replaceable(Decimal('20.00')))
 
 
 class ConsistencyTests(unittest.TestCase):

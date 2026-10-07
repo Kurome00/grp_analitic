@@ -17,13 +17,13 @@
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from core.config import FULL_CHECK_TERM
 from core.lifetimes import (
     age_years,
     default_norm,
+    expiry_date,
     norm_for_name,
     parse_date,
 )
@@ -122,8 +122,8 @@ def critical_title(key: str) -> str:
 
 
 # Короткие названия для плотных таблиц: «ПЗК (предохранительно-запорный
-# клапан)» в графе шириной 150 px обрезается, хотя расшифровка всё равно видна
-# на вкладке «Методика» и в полном названии элемента.
+# клапан)» в графе шириной 150 px обрезается, поэтому в ячейке стоит короткая
+# форма, а расшифровка видна в полном названии элемента.
 CRITICAL_SHORT = {
     'regulator': 'Регулятор',
     'pzk': 'ПЗК',
@@ -159,22 +159,56 @@ class AlgorithmParams:
     reserve: float = 0.50
     max_diag_interval: float = 5.0
 
+    # Ручные значения самих поправок, 0…1. None — считать по формуле методики:
+    # протокола диагностики и режимной карты в базе нет, поэтому K_сост и
+    # K_эксл иначе всегда получаются равными 1.
+    k_state_manual: Optional[float] = None
+    k_cond_manual: Optional[float] = None
+    k_repair_manual: Optional[float] = None
+    k_fail_manual: Optional[float] = None
+
+    # Подписи ручных поправок: ключ поля → (имя в расчёте, человекочитаемое имя).
+    MANUAL_LABELS = (
+        ('k_state_manual', 'K_сост', 'K сост'),
+        ('k_cond_manual', 'K_эксл', 'K эксл (K усл)'),
+        ('k_repair_manual', 'K_рем', 'K рем'),
+        ('k_fail_manual', 'k_повр', 'k повр'),
+    )
+
+    def manual_values(self) -> List[Tuple[str, str, float]]:
+        """Заданные вручную поправки: (имя в расчёте, подпись, значение)."""
+        values = []
+        for attr, name, label in self.MANUAL_LABELS:
+            value = getattr(self, attr)
+            if value is not None:
+                values.append((name, label, float(value)))
+        return values
+
     def as_rows(self) -> List[Tuple[str, str, str, str]]:
         """Строки (параметр, значение, диапазон, назначение) для вкладки исходных данных."""
-        return [
-            ('α — вес отказа', num(self.alpha_fail, 2), '0,05…0,25',
-             f'k_повр = 1 − {num(self.alpha_fail, 2)}·N_отказ − {num(self.beta_damage, 2)}·N_поврежд'),
-            ('β — вес повреждения', num(self.beta_damage, 2), '0,05…0,15',
-             'повреждения слабее отказов (α > β)'),
-            ('θ — вес условий эксплуатации', num(self.theta_conditions, 2), '0,05…0,20',
-             'K_эксл = 1 − θ·(1 − Усл_факт/Усл_норм)'),
-            ('δ — вес качества ремонта', num(self.delta_repair, 2), '0,05…0,20',
-             'K_рем = 1 − δ·(1 − Рем_факт/Рем_норм)'),
-            ('K_запаса', num(self.reserve, 2), '0,3…0,7',
-             'запас на непредсказуемость отказа процесса'),
-            ('T_макс — макс. междиагностический интервал', num(self.max_diag_interval, 1), '5 лет',
-             'Правила МЧС Республики Беларусь'),
+        rows = [
+            ('α — вес отказа', num(self.alpha_fail, 2), '0…1',
+             f'k_повр = 1 − {num(self.alpha_fail, 2)}·N_отказ − {num(self.beta_damage, 2)}·N_поврежд'
+             f' (рекомендуется 0,05…0,25)'),
+            ('β — вес повреждения', num(self.beta_damage, 2), '0…1',
+             'повреждения слабее отказов (α > β), рекомендуется 0,05…0,15'),
+            ('θ — вес условий эксплуатации', num(self.theta_conditions, 2), '0…1',
+             f'K_эксл = 1 − θ·(1 − Усл_факт/Усл_норм), рекомендуется 0,05…0,20'),
+            ('δ — вес качества ремонта', num(self.delta_repair, 2), '0…1',
+             'K_рем = 1 − δ·(1 − Рем_факт/Рем_норм), рекомендуется 0,05…0,20'),
+            ('K_запаса', num(self.reserve, 2), '0…1',
+             'запас на непредсказуемость отказа процесса, рекомендуется 0,3…0,7'),
+            ('T_макс — макс. междиагностический интервал',
+             num(self.max_diag_interval, 1), 'больше 0',
+             'Правила МЧС Республики Беларусь, рекомендуется 5 лет'),
         ]
+        # Ручные поправки показываем только когда они заданы: иначе таблица
+        # распухает строками, которые ничего не меняют.
+        for name, label, value in self.manual_values():
+            rows.append((f'{name} — задано вручную', num(value, 3), '0…1',
+                         f'{label}: значение введено в окне расчёта, формула '
+                         f'методики для него не применяется'))
+        return rows
 
 
 @dataclass
@@ -226,6 +260,8 @@ class ElementResult:
     k_fail_note: str = ''
     n_fail: int = 0
     n_damage: int = 0
+    # Имена поправок, заданных вручную в окне расчёта: 'K_сост', 'K_эксл' и т.д.
+    k_manual: List[str] = field(default_factory=list)
 
     # Шаг 7 — некратные замены
     replacement_sum: Optional[float] = None
@@ -267,6 +303,7 @@ class ElementResult:
             'k_fail_note': self.k_fail_note,
             'n_fail': self.n_fail,
             'n_damage': self.n_damage,
+            'k_manual': list(self.k_manual),
             'replacement_sum': self.replacement_sum,
             'replacement_note': self.replacement_note,
             'z_element': self.z_element,
@@ -344,11 +381,6 @@ FULL_FACTOR_ALGORITHMS: Tuple[int, ...] = (2, 3, 4)
 # звена). Методики 0 и 1 считают среднее арифметическое по всем элементам.
 WEAK_LINK_ALGORITHMS: Tuple[int, ...] = (2, 3, 4)
 
-# Слабым звеном считаем элементы, чей остаточный ресурс не превышает минимальный
-# более чем на это число лет: в пределах года разные элементы дают один и тот же
-# срок, и показывать надо их все, а не только первый попавшийся.
-WEAK_LINK_TOLERANCE = 0.5
-
 
 @dataclass
 class Deadline:
@@ -411,23 +443,35 @@ def driving_part(element: ElementResult) -> Optional[Dict]:
     return _driving_part(element)
 
 
-def collect_weak_links(result: AlgorithmResult,
-                       tolerance: float = WEAK_LINK_TOLERANCE) -> List[WeakLink]:
-    """Слабые звенья результата — все элементы с минимальным ресурсом.
+def weak_link_elements(used: List[ElementResult]) -> List[ElementResult]:
+    """Элементы, ограничивающие ресурс ГРП: минимум и совпавшие с ним по дате.
 
-    Возвращает список, а не одно имя: элементов-минимумов часто несколько
-    (например, у нескольких единиц одновременно истёк срок), и каждый из них
-    ограничивает ресурс ГРП.
+    Слабое звено — элемент с наименьшим остаточным ресурсом; он один и
+    определяет срок. Список, а не одно значение, нужен для случая, когда
+    несколько единиц исчерпывают ресурс в один и тот же день: тогда каждая из
+    них держит общий срок, и замена одной ничего не даёт.
+
+    Совпадение считается по дате истечения (core.lifetimes.expiry_date), а не
+    по близости значений: раньше в слабые звенья попадало всё, что в пределах
+    полугода от минимума, и «слабым звеном» объявлялся почти весь ГРП.
     """
-    used = result.used_elements if result else []
+    used = list(used or [])
     if not used:
         return []
     z_min = min(e.z_element for e in used)
-    limit = z_min + tolerance
+    limit = expiry_date(z_min)
+    coincident = [e for e in used if expiry_date(e.z_element) == limit]
+    return sorted(coincident, key=lambda e: (e.z_element, e.name))
+
+
+def collect_weak_links(result: AlgorithmResult) -> List[WeakLink]:
+    """Слабые звенья результата с определяющей их заменяемой деталью.
+
+    Состав звеньев — как в weak_link_elements: минимум по остаточному ресурсу
+    плюс всё, что истекает с ним в один день.
+    """
     links = []
-    for element in sorted(used, key=lambda e: (e.z_element, e.name)):
-        if element.z_element > limit:
-            break
+    for element in weak_link_elements(result.used_elements if result else []):
         part = _driving_part(element)
         links.append(WeakLink(
             element=element.name,
@@ -630,7 +674,7 @@ class GRPResourceCalculator:
             else:
                 source = 'дата установки оборудования'
             details.append({
-                'name': item.get('name') or 'Деталь',
+                'name': item.get('name') or 'Запчасть',
                 'norm': norm,
                 'install_date': own_date or element.get('install_date'),
                 'age': self._age(own_date or element.get('install_date')),
@@ -653,7 +697,7 @@ class GRPResourceCalculator:
         if norm is None:
             norm = min(d['norm'] for d in details) if details else (
                 _f(equip.get('z_base')) or 0.0)
-            norm_source = 'минимальная норма деталей' if details else 'оценка остаточного ресурса'
+            norm_source = 'минимальная норма запчастей' if details else 'оценка остаточного ресурса'
 
         if install is None and details:
             earliest = min((d['install_date'] for d in details if d['install_date']),
@@ -791,6 +835,29 @@ class GRPResourceCalculator:
         self._calc_k_cond(element, equip)
         self._calc_k_repair(element, equip)
         self._calc_k_fail(element, equip)
+        self._apply_manual_coefficients(element)
+
+    def _apply_manual_coefficients(self, element: ElementResult) -> None:
+        """Заменяет поправки, заданные вручную, сохраняя расчёт и формулы.
+
+        Идёт отдельным шагом после `_calc_k_*`, а не ранним выходом внутри них:
+        так остаются заполненными k_state_detail и подсказки с формулами —
+        в «Пошаговом расчёте» видно и то, что дала бы методика, и то, что
+        принято по вводу пользователя.
+        """
+        attributes = {
+            'K_сост': ('k_state', 'k_state_note'),
+            'K_эксл': ('k_cond', 'k_cond_note'),
+            'K_рем': ('k_repair', 'k_repair_note'),
+            'k_повр': ('k_fail', 'k_fail_note'),
+        }
+        for name, _label, value in self.params.manual_values():
+            value = max(0.0, min(1.0, value))
+            attr, note_attr = attributes[name]
+            setattr(element, attr, value)
+            setattr(element, note_attr,
+                    f'задано вручную в окне расчёта: {name} = {num(value, 4)}')
+            element.k_manual.append(name)
 
     def _calc_k_state(self, element: ElementResult, equip: Dict) -> None:
         """K_сост = 1 − (1/n)·Σ |Δij| / Допускij."""
@@ -971,7 +1038,7 @@ class GRPResourceCalculator:
                 # таких нет, включение его в расчёт дало бы ложные 20 лет
                 # по сроку полной проверки — исключаем и объясняем причину.
                 element.used = False
-                element.skip_reason = 'нет заменяемых деталей'
+                element.skip_reason = 'нет заменяемых запчастей'
             elif element.removed:
                 # Оборудование снято с эксплуатации: его ресурс уже выработан,
                 # в текущую оценку оно не входит. Полная замена оборудования
@@ -1173,7 +1240,13 @@ class GRPResourceCalculator:
 
     @staticmethod
     def _weak_of(used: List[ElementResult]) -> Optional[ElementResult]:
-        return min(used, key=lambda e: e.z_element) if used else None
+        """Первое из слабых звеньев — то же, что показывается первым в списке.
+
+        Берём его из weak_link_elements, а не через min: при совпадении сроков
+        выбор должен быть один и тот же в интерфейсе, в трассировке и в отчёте.
+        """
+        links = weak_link_elements(used)
+        return links[0] if links else None
 
     # -- Алгоритм 1 ---------------------------------------------------------
 

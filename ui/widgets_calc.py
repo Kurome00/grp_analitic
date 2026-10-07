@@ -30,6 +30,9 @@ TINT_WARN = '#fdf3e0'
 TINT_BAD = '#fbeaea'
 TINT_SKIP = '#f0f3f8'
 TINT_PART = '#f5f8fc'
+# Поправки, заданные вручную в окне расчёта: голубым, чтобы их было видно
+# рядом с посчитанными по формулам.
+TINT_MANUAL = '#e8f0fe'
 
 # Единая шкала размеров: текст таблиц и подписей не мельче 10 pt.
 F_TABLE = ('Segoe UI', 10)
@@ -100,6 +103,10 @@ def calc_theme() -> str:
     style.configure('Calc.TEntry', fieldbackground=CARD, foreground=TEXT,
                     font=('Consolas', 11), bordercolor=LINE,
                     insertcolor=TEXT, padding=(6, 5))
+    # Поле коэффициента с недопустимым значением: розовый фон и красная рамка.
+    style.configure('CalcBad.TEntry', fieldbackground=TINT_BAD, foreground=BAD,
+                    font=('Consolas', 11), bordercolor=BAD,
+                    insertcolor=TEXT, padding=(6, 5))
     return saved
 
 
@@ -138,10 +145,19 @@ def head_row(parent, bg: str = CARD, padx: int = 16, pady=(11, 0)):
 
 def note(parent, text, bg: str = CARD, color: str = SUB,
          font: tuple = F_BODY, **pack):
-    """Пояснительная строка читаемым цветом, а не блёклой мелочью."""
+    """Пояснительная строка читаемым цветом, а не блёклой мелочью.
+
+    Длинный текст переносится по ширине родителя: без переноса строка уходила
+    бы за правый край карточки и обрывалась на полуслове.
+    """
     label = tk.Label(parent, text=text, bg=bg, fg=color, font=font,
                      justify=tk.LEFT, anchor=tk.W)
     label.pack(**pack)
+
+    def on_resize(event):
+        label.configure(wraplength=max(240, event.width - 40))
+
+    parent.bind('<Configure>', on_resize, add='+')
     return label
 
 
@@ -150,47 +166,79 @@ def note(parent, text, bg: str = CARD, color: str = SUB,
 class Pane(tk.Frame):
     """Колонка карточек с вертикальной прокруткой.
 
+    Содержимое кладётся в `body`; отступы задаются здесь, при создании панели.
+    `body` упакован внутри рамки, которая лежит в canvas, и **сам в canvas не
+    кладётся повторно**: если упаковать `body` ещё и средствами pack, canvas
+    перестаёт видеть его размер (высота обрезается по высоте окна, а область
+    прокрутки вырождается в точку) — панель перестаёт листаться целиком.
+
     Колонка повторяет ширину окна, поэтому карточки внутри растягиваются на всю
     доступную ширину. Ползунок появляется только когда содержимое выше окна, и
     колёсико мыши работает только пока указатель над этой панелью: у таблиц
     внутри своя прокрутка, и без проверки колесо прокручивало бы обе сразу.
     """
 
-    def __init__(self, parent, bg: str = BG):
+    def __init__(self, parent, bg: str = BG, padx: int = 14, pady=10):
         super().__init__(parent, bg=bg, bd=0)
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
         self.vbar = ttk.Scrollbar(self, orient=tk.VERTICAL,
                                   command=self.canvas.yview,
                                   style='Calc.Vertical.TScrollbar')
-        self.body = tk.Frame(self.canvas, bg=bg, bd=0)
-        self._window = self.canvas.create_window((0, 0), window=self.body,
+        # Рамка-обёртка — единственный элемент canvas; отступы живут внутри неё,
+        # чтобы тело панели оставалось обычным упакованным фреймом.
+        outer = tk.Frame(self.canvas, bg=bg, bd=0)
+        self._window = self.canvas.create_window((0, 0), window=outer,
                                                  anchor='nw')
+        self.body = tk.Frame(outer, bg=bg, bd=0)
+        self.body.pack(fill=tk.X, padx=padx, pady=pady)
         self.canvas.configure(yscrollcommand=self.vbar.set)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.vbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.body.bind('<Configure>', self._resize)
+        self._armed = False
+        self._wheel_ids = []
+        outer.bind('<Configure>', self._resize)
         self.canvas.bind('<Configure>', self._resize)
-        # Колесо ловится на всей панели, а не через bind_all: иначе каждый вход
-        # указателя добавлял ещё одну привязку, и колесо прокручивало бы вниз
-        # тем быстрее, чем дольше открыто окно.
+        # Содержимое растёт не сразу: таблицы подгоняют высоту через after().
+        self.after(20, self._resize)
+        self.after(60, self._resize)
         self.bind('<Enter>', self._arm_wheel, add='+')
         self.bind('<Leave>', self._disarm_wheel, add='+')
 
     def _resize(self, event=None):
-        if event is not None and event.widget is self.canvas:
-            self.canvas.itemconfigure(self._window, width=event.width)
-        self.canvas.configure(scrollregion=self.canvas.bbox('all'))
-        self.after(20, lambda: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.after(50, lambda: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
+        try:
+            if event is not None and event.widget is self.canvas:
+                self.canvas.itemconfigure(self._window, width=event.width)
+            self.canvas.configure(scrollregion=self.canvas.bbox('all'))
+        except tk.TclError:
+            # Окно закрыли раньше, чем отработал отложенный пересчёт.
+            pass
 
     def _arm_wheel(self, _event=None):
-        self.bind_all('<MouseWheel>', self._on_wheel, add='+')
-        self.bind_all('<Shift-MouseWheel>', self._on_hwheel, add='+')
+        """Колесо над панелью листает панель.
+
+        Привязка живёт на окне и снимается по своему идентификатору: панелей в
+        окне несколько, и общий `bind_all` копился бы с каждым входом курсора,
+        прокручивая вниз всё быстрее.
+        """
+        if self._armed:
+            return
+        self._armed = True
+        toplevel = self.winfo_toplevel()
+        self._wheel_ids = [toplevel.bind('<MouseWheel>', self._on_wheel,
+                                         add='+')]
 
     def _disarm_wheel(self, _event=None):
-        self.unbind_all('<MouseWheel>')
-        self.unbind_all('<Shift-MouseWheel>')
+        if not self._armed:
+            return
+        self._armed = False
+        toplevel = self.winfo_toplevel()
+        for funcid in self._wheel_ids:
+            try:
+                toplevel.unbind('<MouseWheel>', funcid)
+            except tk.TclError:
+                pass
+        self._wheel_ids = []
 
     def _contains(self, x_root, y_root) -> bool:
         try:
@@ -207,12 +255,6 @@ class Pane(tk.Frame):
         if not self._contains(event.x_root, event.y_root):
             return
         self.canvas.yview_scroll(-int(event.delta / 120), 'units')
-        return 'break'
-
-    def _on_hwheel(self, event):
-        if not self._contains(event.x_root, event.y_root):
-            return
-        self.canvas.xview_scroll(-int(event.delta / 120), 'units')
         return 'break'
 
     def to_top(self):

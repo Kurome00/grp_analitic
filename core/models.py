@@ -21,11 +21,3 @@ class Equipment:
         местах приложения.
         """
         return lifetime_months(self.install_date, self.removal_date)
-
-
-@dataclass
-class Part:
-    """Модель типа запчасти (справочник)"""
-
-    name: str
-    norm_years: float

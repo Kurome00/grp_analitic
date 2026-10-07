@@ -5,6 +5,7 @@ from datetime import datetime
 import psycopg2
 
 from core.config import DB_CONFIG, REPLACEABLE_NORM_YEARS, part_norm
+from core.grp_passport import BASE_COLUMNS, COLUMNS, PASSPORT_COLUMNS, ROW_COLUMNS
 
 
 class DatabasePG:
@@ -104,6 +105,17 @@ class DatabasePG:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+
+            # 1.1 Сведения паспорта ГРП (раздел 1). Хранятся текстом: даты
+            # приёмки и ввода в паспорте указаны с точностью до месяца
+            # («01.1981», «10.2007»), DATE такого не представляет, а
+            # «Закольцован с» — свободный список объектов. NOT NULL DEFAULT ''
+            # убирает третье состояние (NULL рядом с пустой строкой): отчёт
+            # печатает прочерк по пустому значению.
+            for column in PASSPORT_COLUMNS:
+                cursor.execute(
+                    f"ALTER TABLE grp ADD COLUMN IF NOT EXISTS {column} "
+                    f"TEXT NOT NULL DEFAULT ''")
 
             # 2. Таблица оборудования
             cursor.execute('''
@@ -237,26 +249,50 @@ class DatabasePG:
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ГРП ===
 
-    def add_grp(self, grp_type: str, lines_count: int, actual_life: float, design_life: float) -> int:
-        """Добавление нового ГРП"""
+    def add_grp(self, grp_type: str, lines_count: int, actual_life: float,
+                design_life: float, passport: Dict = None) -> int:
+        """Добавление нового ГРП.
+
+        passport — сведения паспорта {ключ: значение} (см. core.grp_passport);
+        незаполненные поля сохраняются пустыми строками. Параметр
+        необязательный, поэтому старые вызовы с четырьмя аргументами
+        (seed.py) продолжают работать.
+        """
+        fields = dict(passport or {})
+        columns = list(COLUMNS)
+        params = [grp_type, lines_count, actual_life, design_life] + [
+            fields.get(column) or '' for column in PASSPORT_COLUMNS]
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO grp (type, lines_count, actual_life, design_life)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id
-            ''', (grp_type, lines_count, actual_life, design_life))
+            cursor.execute(
+                f'INSERT INTO grp ({", ".join(columns)}) '
+                f'VALUES ({", ".join(["%s"] * len(columns))}) '
+                f'RETURNING id',
+                params)
             return cursor.fetchone()[0]
 
-    def update_grp(self, grp_id: int, grp_type: str, lines_count: int, actual_life: float, design_life: float):
-        """Обновление данных ГРП"""
+    def update_grp(self, grp_id: int, grp_type: str, lines_count: int,
+                   actual_life: float, design_life: float,
+                   passport: Dict = None):
+        """Обновление данных ГРП.
+
+        passport=None — паспортные поля не трогаем: так обновляют ГРП из
+        кода, которому сведения паспорта не нужны.
+        """
+        fields = dict(passport or {})
+        columns = list(BASE_COLUMNS)
+        params = [grp_type, lines_count, actual_life, design_life]
+        if passport is not None:
+            columns += list(PASSPORT_COLUMNS)
+            params += [fields.get(column) or '' for column in PASSPORT_COLUMNS]
+        params.append(grp_id)
+        assignments = ', '.join(f'{column} = %s' for column in columns)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE grp
-                SET type = %s, lines_count = %s, actual_life = %s, design_life = %s, updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            ''', (grp_type, lines_count, actual_life, design_life, grp_id))
+            cursor.execute(
+                f'UPDATE grp SET {assignments}, '
+                f'updated_at = CURRENT_TIMESTAMP WHERE id = %s',
+                params)
 
     def delete_grp(self, grp_id: int):
         """Удаление ГРП (оборудование и коэффициенты удаляются каскадом)"""
@@ -265,17 +301,24 @@ class DatabasePG:
             cursor.execute('DELETE FROM grp WHERE id = %s', (grp_id,))
 
     def get_all_grp(self) -> List[Tuple]:
-        """Получение всех ГРП"""
+        """Получение всех ГРП (id, type, lines_count, actual_life, design_life)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT id, type, lines_count, actual_life, design_life FROM grp ORDER BY id')
             return cursor.fetchall()
 
     def get_grp_by_id(self, grp_id: int) -> Optional[Tuple]:
-        """Получение ГРП по ID"""
+        """Получение ГРП по ID.
+
+        Порядок колонок — core.grp_passport.ROW_COLUMNS: сначала id и четыре
+        прежних поля (по их индексам читают интерфейс и отчёт), затем сведения
+        паспорта. Спискам паспорт не нужен, поэтому get_all_grp не расширяется.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, type, lines_count, actual_life, design_life FROM grp WHERE id = %s', (grp_id,))
+            cursor.execute(
+                f'SELECT {", ".join(ROW_COLUMNS)} FROM grp WHERE id = %s',
+                (grp_id,))
             return cursor.fetchone()
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ОБОРУДОВАНИЕМ ===
@@ -400,19 +443,6 @@ class DatabasePG:
             self.update_part_norm(part_id, expected)
             counters['lower_to' if expected < legacy else 'raise_to'] += 1
         return counters
-
-    def get_part_by_id(self, part_id: int) -> Optional[Tuple]:
-        """Тип запчасти по id (id, name, norm_years, is_replaceable)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, name, norm_years, is_replaceable FROM parts WHERE id = %s', (part_id,))
-            return cursor.fetchone()
-
-    def delete_part(self, part_id: int):
-        """Удаление типа запчасти (связи удаляются каскадом)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM parts WHERE id = %s', (part_id,))
 
     def get_all_parts(self) -> List[Tuple]:
         """Все типы запчастей (id, name, norm_years, is_replaceable)"""
@@ -602,25 +632,6 @@ class DatabasePG:
                 JOIN parts p ON p.id = ep.part_id
                 WHERE ep.equipment_id = %s
                 ORDER BY p.name, ep.install_date NULLS FIRST, ep.id
-            ''', (equipment_id,))
-            return cursor.fetchall()
-
-    def get_active_replaceable_parts(self, equipment_id: int) -> List[Tuple]:
-        """Активные заменяемые детали оборудования.
-
-        (id, part_id, name, norm_years, part_number, install_date) —
-        кандидаты на замену. install_date = дата последней установки детали
-        (None означает «дата установки оборудования»).
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT ep.id, ep.part_id, p.name, p.norm_years,
-                       ep.part_number, ep.install_date::text
-                FROM equipment_parts ep
-                JOIN parts p ON p.id = ep.part_id
-                WHERE ep.equipment_id = %s AND ep.removal_date IS NULL AND p.is_replaceable
-                ORDER BY p.name
             ''', (equipment_id,))
             return cursor.fetchall()
 

@@ -6,10 +6,11 @@
 """
 import copy
 import tkinter as tk
-from datetime import date, timedelta
+from datetime import date
 from tkinter import messagebox, ttk
 
 from core.config import FULL_CHECK_TERM
+from core.lifetimes import expiry_date
 from core.timefmt import years_to_text
 from ui.window_utils import fit_window
 from ui.widgets_calc import (
@@ -26,6 +27,7 @@ from ui.widgets_calc import (
     TEXT,
     TINT_BAD,
     TINT_GOOD,
+    TINT_MANUAL,
     TINT_PART,
     TINT_SKIP,
     TINT_WARN,
@@ -49,11 +51,8 @@ from logic.algorithms import (
     GRPResourceCalculator,
     POOR_REPAIR_MARKERS,
     PRIMARY_ALGORITHM,
-    WEAK_LINK_ALGORITHMS,
-    WEAK_LINK_TOLERANCE,
     AlgorithmParams,
     algo_label,
-    algo_source,
     calculate_all_algorithms,
     classify_critical,
     critical_short_title,
@@ -61,6 +60,7 @@ from logic.algorithms import (
     driving_part,
     num,
     signed_years,
+    weak_link_elements,
 )
 
 MUTED = SUB
@@ -71,7 +71,7 @@ MUTED = SUB
 RAIL_W = 244
 
 # Предел горизонта на ползунке «Срок замены»: пять лет — норма заменяемых
-# деталей, дальше смотреть бессмысленно, там всё равно всё просрочено.
+# запчастей, дальше смотреть бессмысленно, там всё равно всё просрочено.
 HORIZON_MAX = 5.0
 # Ползунок щёлкает по месяцам: подписанный срок всегда получается ровным
 # («2 года 5 мес»), а не «2 года 5 мес 2 дн» из-за дробного шага мыши.
@@ -79,18 +79,9 @@ HORIZON_SNAP = 1.0 / 12.0
 CONSERVATIVE_NOTE = (
     f'Сроки по {algo_label(DEADLINE_ALGORITHMS[0])} и {algo_label(DEADLINE_ALGORITHMS[1])} '
     'показываются раздельно: сводить их в одну величину '
-    'нельзя — они считают разные величины (по заменяемым деталям и по '
+    'нельзя — они считают разные величины (по заменяемым запчастям и по '
     'календарному сроку оборудования), поэтому расхождение между ними ожидаемо.'
 )
-
-TRACE_COLORS = {
-    'title': (ACCENT, True, False),
-    'formula': ('#123a8f', True, False),
-    'value': (TEXT, False, False),
-    'note': (SUB, False, True),
-    'warn': (BAD, True, False),
-}
-
 
 def _btn(parent, text, command, color=ACCENT, font_size=10, padx=14):
     """Плоская кнопка с подсветкой при наведении."""
@@ -120,23 +111,78 @@ def _darken(hex_color, factor=0.85):
     return '#%02x%02x%02x' % (int(r * factor), int(g * factor), int(b * factor))
 
 
-def _text_block(parent, height=12, font=F_BODY, bg=CARD):
-    """Прокручиваемый текстовый блок с тегами подсветки."""
-    holder = tk.Frame(parent, bg=bg)
-    holder.pack(fill=tk.BOTH, expand=True)
-    box = tk.Text(holder, wrap=tk.WORD, font=font, height=height, bd=0,
-                  highlightthickness=0, bg=bg, fg=TEXT, padx=16, pady=12,
-                  spacing1=0, spacing3=4)
-    scrollbar = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=box.yview,
-                              style='Calc.Vertical.TScrollbar')
-    box.configure(yscrollcommand=scrollbar.set)
-    box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    return box
+def _bound_text(value):
+    """Граница диапазона в сообщении: «0», «1», «0,05» — без лишних нулей."""
+    return num(value, 0 if float(value).is_integer() else 2)
+
+
+def _range_text(lo, hi):
+    """Подпись диапазона рядом с полем: «0…1» или «больше 0»."""
+    if hi is None:
+        return f'больше {_bound_text(lo)}'
+    return f'{_bound_text(lo)}…{_bound_text(hi)}'
+
+
+def _manual_text(value):
+    """Ручной K в поле: «0,85» вместо «0,850» — лишние нули только мешают."""
+    if value is None:
+        return ''
+    return f'{float(value):.4f}'.rstrip('0').rstrip('.').replace('.', ',')
+
+
+def parse_coefficient(raw, label, lo=0.0, hi=1.0, allow_empty=True):
+    """Поле коэффициента → (значение, текст ошибки).
+
+    Пустая строка — «считать по формуле»: (None, ''). Значение вне диапазона
+    (или не число) не принимается: значение None и текст, по которому поле
+    подсвечивается. Разбор вынесен из окна, чтобы проверялся тестами без Tk.
+
+    hi=None — верхней границы нет, и нижняя берётся строго («больше 0»):
+    так проверяется T_макс, он измеряется годами, а не долями единицы.
+    """
+    text = (raw or '').strip().replace(',', '.')
+    if not text:
+        return None, '' if allow_empty else f'{label}: укажите значение'
+    limit = _range_text(lo, hi)
+    try:
+        value = float(text)
+    except ValueError:
+        return None, f'{label}: нужно число {limit}'
+    if value < lo or (hi is None and value == lo) \
+            or (hi is not None and value > hi):
+        return None, f'{label}: допускается {limit}'
+    return value, ''
+
+
+# Поля панели «Коэффициенты методики»: (поле, подпись, разрядность, назначение,
+# нижняя граница, верхняя граница). Все коэффициенты принимаются от 0 до 1;
+# верхняя граница None означает «строго больше нижней» (T_макс — срок в годах).
+WEIGHT_FIELDS = (
+    ('alpha_fail', 'α · отказ', 2, 'k повр = 1 − α·N_отказ − β·N_повр',
+     0.0, 1.0),
+    ('beta_damage', 'β · повреждение', 2, 'повреждения слабее отказов (α > β)',
+     0.0, 1.0),
+    ('theta_conditions', 'θ · условия', 2, 'K эксл = 1 − θ·(1 − Усл/Усл.норм)',
+     0.0, 1.0),
+    ('delta_repair', 'δ · ремонт', 2, 'K рем = 1 − δ·(1 − Рем/Рем.норм)',
+     0.0, 1.0),
+    ('reserve', 'K запаса', 2, 'T диагн = min(Z_ГРП·K_запаса; T_макс)',
+     0.0, 1.0),
+    ('max_diag_interval', 'T_макс', 1,
+     'верхняя граница междиагностического интервала', 0.0, None),
+)
+
+# Ручные поправки: пустое поле — считать по формуле методики.
+MANUAL_FIELDS = (
+    ('k_state_manual', 'K сост', 'вместо расчёта по протоколу диагностики'),
+    ('k_cond_manual', 'K эксл (K усл)', 'вместо расчёта по режимной карте'),
+    ('k_repair_manual', 'K рем', 'вместо оценки по виду ремонта'),
+    ('k_fail_manual', 'k повр', 'вместо 1 − α·N_отказ − β·N_повр'),
+)
 
 
 def _part_residual(part):
-    """Остаток заменяемой детали: заданный методикой, иначе норма минус возраст."""
+    """Остаток заменяемой запчасти: заданный методикой, иначе норма минус возраст."""
     if not part:
         return None
     z = part.get('z_base')
@@ -176,19 +222,24 @@ def _horizon_text(value):
 
 
 def _counted_parts(element):
-    """Детали элемента, которые методика действительно учитывает (норма 5 лет)."""
+    """Запчасти элемента, которые методика действительно учитывает (норма 5 лет)."""
     return [d for d in (element.details or []) if _is_counted_part(d)]
 
 
 def _pick_parts(element):
-    """Что менять у элемента: просроченные детали, иначе ближайшую к замене."""
+    """Что менять у элемента: одна запчасть — та, что держит ресурс элемента.
+
+    Это запчасть с наименьшим остатком (её же показывает отчёт как
+    «определяющую»). Раньше сюда попадали все просроченные запчасти сразу, и шаг
+    продления выглядел как требование менять пол-элемента, хотя срок двигает
+    только самая изношенная: остальные истекают позже.
+    """
     parts = _counted_parts(element)
-    expired = [d for d in parts if _part_residual(d) <= 0]
-    return expired or sorted(parts, key=_part_residual)[:1]
+    return sorted(parts, key=_part_residual)[:1]
 
 
 def _parts_text(parts, limit=3):
-    """Перечень деталей для строки: первые несколько и сколько ещё."""
+    """Перечень запчастей для строки: первые несколько и сколько ещё."""
     names = [str(d.get('name')) for d in parts]
     if not names:
         return '—'
@@ -196,11 +247,169 @@ def _parts_text(parts, limit=3):
     return shown if len(names) <= limit else f'{shown} и ещё {len(names) - limit}'
 
 
+def counted_part_keys(payload):
+    """Учитываемые запчасти ГРП парами (equipment_id, name).
+
+    Имя запчасти — единственная связь между payload и element.details: в
+    подробностях расчёта лежат те же имена (logic/algorithms.py, _active_details).
+    """
+    keys = set()
+    for equipment in payload or []:
+        equipment_id = equipment.get('equipment_id')
+        for detail in equipment.get('details') or []:
+            if _is_counted_part({'norm': detail.get('norm_years')}):
+                keys.add((equipment_id, detail.get('name')))
+    return keys
+
+
+def simulate_with_renewed(number, payload, params, coefficients, renewed):
+    """Пересчёт методики, если названные запчасти заменены сегодня.
+
+    renewed — пары (equipment_id, name): меняется одна названная запчасть, а не
+    весь узел. Иначе прирост в шаге продления обещал бы одно, а считался бы по
+    замене всего оборудования.
+
+    Идёт через настоящий движок, а не через копию формул: иначе лестница
+    продления разошлась бы с расчётом при любой правке методики.
+    """
+    payload = copy.deepcopy(payload or [])
+    today = date.today().isoformat()
+    for equipment in payload:
+        equipment_id = equipment.get('equipment_id')
+        for detail in equipment.get('details') or []:
+            if not _is_counted_part({'norm': detail.get('norm_years')}):
+                continue
+            if (equipment_id, detail.get('name')) in renewed:
+                detail['install_date'] = today
+    calculator = GRPResourceCalculator(None, params, coefficients)
+    return getattr(calculator, f'calculate_algorithm_{number}')(payload)
+
+
+def extension_step_limit(payload):
+    """Сколько шагов замен считаем: по числу запчастей, но не больше предела.
+
+    Шагов нужно не меньше, чем учитываемых запчастей в ГРП: пока срок держит
+    запчасть за запчастью, лестница на двенадцати шагах обрывалась бы на
+    середине и сообщала, что продлить больше нельзя, хотя менять осталось ещё.
+    """
+    return max(EXTENSION_STEPS,
+               min(len(counted_part_keys(payload)) + 1, EXTENSION_STEPS_MAX))
+
+
+def _ladder_candidate(result, seen):
+    """Ближайшая к замене запчасть среди слабых звеньев: (элемент, запчасть).
+
+    Слабых звеньев обычно несколько: если у элементов срок истекает в один день,
+    замена запчасти одного из них не двигает общий срок — минимум держит другой.
+    Поэтому кандидат перебирается по всем слабым звеньям, а уже заменённые
+    запчасти пропускаются: у одного узла изношенных запчастей может быть
+    несколько, и каждая — отдельный шаг.
+    """
+    for element in weak_link_elements(result.used_elements):
+        picked = _pick_parts(element)
+        if not picked:
+            continue
+        part = picked[0]
+        if (element.equipment_id, part.get('name')) not in seen:
+            return element, part
+    return None, None
+
+
+def build_extension_ladder(number, payload, params, coefficients, result,
+                           limit=None):
+    """Лестница продления: замена каких запчастей что даёт, шаг за шагом.
+
+    Шаг — замена запчастей текущего слабого звена. Оборудование здесь не
+    меняется: замена узла целиком остаётся отдельной операцией в журнале замен
+    (db/database_pg.py, replace_equipment_completely).
+
+    Шаг набирает столько запчастей, сколько нужно, чтобы срок действительно
+    сдвинулся: у просроченного элемента изношенных запчастей бывает несколько, а
+    у совпавших по сроку слабых звеньев срок держит каждое — от замены одной
+    запчасти результат не меняется. Обычный случай — одна запчасть за шаг.
+
+    Если замена запчастей срок не двигает вовсе, лестница — один шаг с
+    «parts_ineffective»: «no_parts» — учитываемых запчастей в ГРП нет,
+    «weak_without_parts» — они есть, но слабое звено держит срок не по ним.
+    """
+    steps = []
+    if result is None or result.error or not result.used_elements:
+        return steps
+    weak = weak_link_elements(result.used_elements)[0]
+    all_parts = counted_part_keys(payload)
+    if limit is None:
+        limit = extension_step_limit(payload)
+    probe = (simulate_with_renewed(number, payload, params, coefficients, all_parts)
+             if all_parts else None)
+    picked = _pick_parts(weak)
+    if probe is None or abs(probe.result - result.result) <= 1e-9:
+        # Либо учитываемых запчастей в ГРП нет, либо замена всех их срок не
+        # изменила: методика считает ресурс по оборудованию, а не по износу
+        # запчастей. Менять по расчёту нечего.
+        return [{'element': weak, 'parts': picked,
+                 'before': result.result, 'after': result.result, 'gain': 0.0,
+                 'stuck': True, 'parts_ineffective': True,
+                 'no_parts': not all_parts,
+                 'weak_without_parts': bool(all_parts) and not picked}]
+
+    renewed, seen = set(), set()
+    sim = simulate_with_renewed(number, payload, params, coefficients, renewed)
+    for _ in range(limit):
+        if sim.error or not sim.used_elements:
+            break
+        element, part = _ladder_candidate(sim, seen)
+        if part is None:
+            # Все слабые звенья обойдены: менять у них больше нечего.
+            steps.append({'element': weak_link_elements(sim.used_elements)[0],
+                          'parts': [], 'before': sim.result, 'after': sim.result,
+                          'gain': 0.0, 'stuck': True})
+            break
+        owner, parts, units = element, [], [element.name]
+        after = sim
+        while True:
+            key = (element.equipment_id, part.get('name'))
+            renewed.add(key)
+            seen.add(key)
+            parts.append(part)
+            after = simulate_with_renewed(number, payload, params, coefficients,
+                                          renewed)
+            if after.result > sim.result + 1e-9:
+                break
+            element, part = _ladder_candidate(after, seen)
+            if part is None:
+                break
+            if element.name not in units:
+                units.append(element.name)
+        gain = after.result - sim.result
+        steps.append({'element': owner, 'units': units, 'parts': parts,
+                      'before': sim.result, 'after': after.result, 'gain': gain,
+                      'stuck': gain <= 0})
+        sim = after
+    return steps
+
+
+def _step_head_text(step):
+    """Что даёт шаг: «замена запчасти «X» в «РДБК-1М-50/35» даёт +1 год 2 мес»."""
+    names = [str(part.get('name')) for part in step.get('parts') or []]
+    if not names:
+        return ''
+    listed = ', '.join(f'«{name}»' for name in names[:2])
+    if len(names) > 2:
+        listed += f' и ещё {len(names) - 2}'
+    units = [str(name) for name in (step.get('units') or [step['element'].name])]
+    where = ', '.join(f'«{name[:40]}»' for name in units[:2])
+    if len(units) > 2:
+        where += f' и ещё {len(units) - 2}'
+    what = 'запчасти' if len(names) == 1 else 'запчастей'
+    return (f'замена {what} {listed} в {where} даёт '
+            f'+{years_to_text(step["gain"])}')
+
+
 def _last_replacement_on(journal):
     """Самая поздняя дата замены в журнале ('ГГГГ-ММ-ДД').
 
     Журнал замен ведётся по типам оборудования, а не по запчастям, поэтому дата
-    последнего ремонта — единственный ориентир для деталей без собственной даты
+    последнего ремонта — единственный ориентир для запчастей без собственной даты
     установки. Допущение выносится в замечания к расчёту, чтобы пользователь
     видел, откуда взялась дата.
     """
@@ -217,13 +426,13 @@ def _last_replacement_on(journal):
 
 
 def _tree_hier(parent, columns, widths, height=8):
-    """Дерево с раскрываемыми строками: оборудование → его детали."""
+    """Дерево с раскрываемыми строками: оборудование → его запчасти."""
     return table(parent, columns, widths, height=height, expand=False,
                  tree=True, tree_width=300)
 
 
 def _is_counted_part(detail):
-    """Деталь входит в методику: норма ровно 5 лет."""
+    """Запчасть входит в методику: норма ровно 5 лет."""
     if not detail:
         return False
     norm = detail.get('norm', detail.get('norm_years'))
@@ -234,9 +443,19 @@ def _is_counted_part(detail):
 
 
 def _due_date(years):
-    """Дата истечения срока, отсчитанная от сегодняшней даты."""
-    days = int(round(float(years) * 365.25))
-    return (date.today() + timedelta(days=days)).isoformat()
+    """Дата истечения срока, отсчитанная от сегодняшней даты.
+
+    Считается в core.lifetimes: по этой же дате ядро сравнивает сроки
+    элементов, когда выбирает слабое звено. Своя арифметика здесь разошлась бы
+    с ядром на сутки — и «одновременно истекающие» элементы перестали бы
+    совпадать в отчёте и на экране.
+    """
+    return expiry_date(years).isoformat()
+
+
+def _due_text(years):
+    """Та же дата, но для фразы: «07.10.2029» — в предложении ISO читается плохо."""
+    return expiry_date(years).strftime('%d.%m.%Y')
 
 
 def _canvas_round_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
@@ -253,22 +472,28 @@ def _canvas_round_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
     return canvas.create_polygon(points, smooth=True, splinesteps=16, **kwargs)
 
 
-# Норма заменяемой детали, которую методика действительно учитывает. Детали
+# Норма заменяемой запчасти, которую методика действительно учитывает. Запчасти
 # с другой нормой в расчёт не попадают, поэтому и в списки на замену их
 # показывать нельзя — иначе список будет врать про сроки.
 PART_NORM_YEARS = 5.0
 # «Скоро нужно менять»: остаток меньше года. Плюс всегда показывается
-# ближайшее звено, даже если оно дальше года — иначе на календарной шкале
+# слабое звено, даже если оно дальше года — иначе на календарной шкале
 # (Алгоритм 4, где остаток измеряется годами до полной проверки) список был
 # бы пустым и выглядел бы как ошибка.
 SOON_HORIZON = 1.0
-# Продление: сколько лет максимум просим и сколько шагов замен считаем.
+# Продление: ползунок задаёт нужный срок в годах от сегодня (до 20 лет — это
+# предел полной проверки), и сколько шагов замен максимум считаем.
+# Шагов нужно не меньше, чем учитываемых запчастей в ГРП: пока срок держит
+# запчасть за запчастью, лестница на двенадцати шагах обрывалась бы на середине
+# и сообщала, что продлить больше нельзя, хотя менять осталось ещё.
+# Верхняя граница — чтобы очень большой ГРП не считался минутами.
 EXTENSION_MAX = 20.0
 EXTENSION_STEPS = 12
+EXTENSION_STEPS_MAX = 60
 
 CONSERVATIVE_SCALE = (
     'Это срок до полной проверки оборудования (норма элемента '
-    f'{num(FULL_CHECK_TERM, 0)} лет), а не срок службы детали: поэтому '
+    f'{num(FULL_CHECK_TERM, 0)} лет), а не срок службы запчасти: поэтому '
     'здесь он и больше 5 лет.'
 )
 
@@ -517,21 +742,13 @@ class AlgorithmsWindow:
         self.tab_coefficients = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_coefficients, text='  Коэффициенты  ')
 
-        self.tab_trace = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.tab_trace, text='  Пошаговый расчёт  ')
-
         self.tab_inputs = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_inputs, text='  Исходные данные  ')
-
-        self.tab_method = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.tab_method, text='  Методика  ')
-        self._build_method_tab()
 
         self._algo_var = tk.IntVar(value=PRIMARY_ALGORITHM)
         self._build_algorithms_tab()
         self._build_horizon_tab()
         self._build_coefficients_tab()
-        self._build_trace_tab()
         self._build_inputs_tab()
 
     def _build_header(self):
@@ -583,7 +800,6 @@ class AlgorithmsWindow:
     def _on_algorithm_changed(self, _event=None):
         self._algo_var.set(self._combo_algo.current())
         self.render_coefficients()
-        self.render_trace()
 
     # ------------------------------------------------- Вертикальные вкладки
 
@@ -602,6 +818,9 @@ class AlgorithmsWindow:
         self._payload = []
         self._coefficients_now = {}
         self._ladders = {}
+        # Сколько шагов разрешено лестнице продления: у каждой методики своё
+        # число элементов, и обрыв по лимиту надо отличать от «продлить нечем».
+        self._ladder_limit = {}
 
         # Лента методик. Плитки компактные и не переносятся: пять методик
         # должны помещаться в ленту целиком при любой высоте окна, иначе
@@ -615,7 +834,7 @@ class AlgorithmsWindow:
         holder = tk.Frame(wrap, bg=BG)
         holder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
         for number in range(5):
-            pane = Pane(holder)
+            pane = Pane(holder, pady=(0, 14))
             self.algo_panes.append(pane)
             self._build_algorithm_pane(pane, number)
         self._select_algorithm(PRIMARY_ALGORITHM)
@@ -695,7 +914,6 @@ class AlgorithmsWindow:
     def _build_algorithm_pane(self, tab, number):
         """Панель одной методики: остаток, список замен и продление срока."""
         body = tab.body
-        body.pack_configure(fill=tk.X, padx=14, pady=(0, 14))
 
         top = card(body)
         top.pack(fill=tk.X)
@@ -729,7 +947,7 @@ class AlgorithmsWindow:
     # ------------------------------------------------- Скоро нужно менять
 
     def _build_soon_card(self, parent, number):
-        """Список того, что скоро придётся менять, с деталями внутри строки."""
+        """Список того, что скоро придётся менять, с запчастями внутри строки."""
         box = card(parent)
         box.pack(fill=tk.X, pady=(12, 0))
         head = head_row(box)
@@ -740,10 +958,9 @@ class AlgorithmsWindow:
 
         self.soon_trees[number] = _tree_hier(
             box,
-            columns=('Категория', 'Норма', 'Возраст', 'Осталось',
-                     'Истекает', 'Статус'),
+            columns=('Категория', 'Норма', 'Возраст', 'Осталось', 'Истекает'),
             widths={'Категория': 150, 'Норма': 85, 'Возраст': 95, 'Осталось': 115,
-                    'Истекает': 110, 'Статус': 120},
+                    'Истекает': 110},
             height=5,
         )
         for tag, color in (('soon', TINT_WARN), ('over', TINT_BAD),
@@ -751,7 +968,7 @@ class AlgorithmsWindow:
             self.soon_trees[number].tag_configure(tag, background=color)
 
     def _render_soon_card(self, number):
-        """Заполняет список замен: строка — элемент, вложенные — его детали."""
+        """Заполняет список замен: строка — элемент, вложенные — его запчасти."""
         tree = self.soon_trees[number]
         tree.delete(*tree.get_children())
         result = self.results.get(number)
@@ -765,10 +982,12 @@ class AlgorithmsWindow:
             self.soon_counts[number].config(text='нет элементов в расчёте', fg=BAD)
             fit_table(tree, 0)
             return
-        nearest = min(e.z_element for e in used)
-        due = [e for e in used
-               if e.z_element <= SOON_HORIZON
-               or e.z_element <= nearest + WEAK_LINK_TOLERANCE]
+        # В списке — всё, что истекает в пределах горизонта, и слабое звено
+        # целиком (минимум со всем, что совпало с ним по дате): на календарной
+        # методике ресурс измеряется годами до полной проверки, и без минимума
+        # список был бы пустым и выглядел бы как ошибка расчёта.
+        weak = weak_link_elements(used)
+        due = [e for e in used if e.z_element <= SOON_HORIZON or e in weak]
 
         rows = 0
         for element in sorted(due, key=lambda e: (e.z_element, e.name)):
@@ -780,24 +999,24 @@ class AlgorithmsWindow:
                 years_to_text(element.age),
                 years_to_text(element.z_element),
                 _due_date(element.z_element),
-                'просрочено' if element.z_element <= 0 else 'скоро',
             ))
             rows += 1
-            parts = [d for d in (element.details or []) if _is_counted_part(d)]
+            # Внутри строки — только та запчасть, которая держит ресурс
+            # элемента: остальные истекают позже и срока не двигают.
+            parts = _pick_parts(element)
             if not parts:
                 tree.insert(parent, tk.END, tags=('part',),
-                            text='нет деталей с нормой 5 лет в расчёте',
-                            values=('', '—', '—', '—', '', ''))
+                            text='нет запчастей с нормой 5 лет в расчёте',
+                            values=('', '—', '—', '—', ''))
                 rows += 1
                 continue
-            for detail in sorted(parts, key=_part_residual):
+            for detail in parts:
                 left = _part_residual(detail)
                 tree.insert(parent, tk.END, tags=('part',), text=(
-                    f'    {detail.get("name", "деталь")}'), values=(
-                    'деталь', years_to_text(detail.get('norm')),
+                    f'    {detail.get("name", "запчасть")}'), values=(
+                    'запчасть', years_to_text(detail.get('norm')),
                     years_to_text(detail.get('age')), years_to_text(left),
                     _due_date(left),
-                    'просрочена' if left <= 0 else 'осталось',
                 ))
                 rows += 1
 
@@ -829,9 +1048,9 @@ class AlgorithmsWindow:
 
         self.ext_trees[number] = _tree_hier(
             box,
-            columns=('Категория', 'Что менять', 'Срок сейчас',
+            columns=('Категория', 'Запчасть', 'Срок сейчас',
                      'Срок после замены', 'Прирост'),
-            widths={'Категория': 130, 'Что менять': 330, 'Срок сейчас': 130,
+            widths={'Категория': 130, 'Запчасть': 330, 'Срок сейчас': 130,
                     'Срок после замены': 150, 'Прирост': 115},
             height=3,
         )
@@ -841,81 +1060,40 @@ class AlgorithmsWindow:
 
         slider_row = tk.Frame(box, bg=CARD)
         slider_row.pack(fill=tk.X, padx=18, pady=(10, 14))
-        tk.Label(slider_row, text='Хочу продлить на', bg=CARD, fg=TEXT,
-                 font=F_TABLE_B).pack(anchor=tk.W, pady=(0, 2))
+        caption = tk.Frame(slider_row, bg=CARD)
+        caption.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(caption, text='Хочу продлить', bg=CARD, fg=TEXT,
+                 font=F_TABLE_B).pack(side=tk.LEFT)
+        tk.Label(caption, text='— сколько лет должно остаться от сегодня',
+                 bg=CARD, fg=SUB, font=F_BODY).pack(side=tk.LEFT, padx=(6, 0))
         self.ext_sliders[number] = HorizonSlider(
             slider_row, EXTENSION_MAX, HORIZON_SNAP,
             command=lambda _value, n=number: self._render_extension(n))
         self.ext_sliders[number].pack(fill=tk.X, expand=True)
         self.ext_sliders[number].set(0.0)
 
-    def _simulate(self, number, renewed_ids):
-        """Пересчёт методики с условно заменёнными деталями.
+    def _simulate(self, number, renewed):
+        """Пересчёт методики с условно заменёнными запчастями.
 
-        Идёт через настоящий движок, а не через копию формул: иначе лестница
-        продления разошлась бы с расчётом при любой правке методики.
+        renewed — пары (equipment_id, name): меняется названная запчасть, а не
+        весь узел.
         """
-        payload = copy.deepcopy(self._payload or [])
-        today = date.today().isoformat()
-        for equipment in payload:
-            if equipment.get('equipment_id') not in renewed_ids:
-                continue
-            for detail in equipment.get('details') or []:
-                if _is_counted_part({'norm': detail.get('norm_years')}):
-                    detail['install_date'] = today
-        calculator = GRPResourceCalculator(None, self.params, self._coefficients_now)
-        return getattr(calculator, f'calculate_algorithm_{number}')(payload)
+        return simulate_with_renewed(number, self._payload, self.params,
+                                     self._coefficients_now, renewed)
 
     def _extension_ladder(self, number):
-        """Лестница: какая замена что даёт, шаг за шагом.
+        """Лестница: какая замена запчастей что даёт, шаг за шагом.
 
         Считается один раз на методику и кэшируется, иначе на каждое движение
         ползунка пришлось бы гонять пересчёт заново.
-
-        Слабых звеньев обычно несколько: если у пяти элементов ресурс одинаковый,
-        замена одного из них не двигает общий срок — минимум держит другой.
-        Поэтому шаг продолжается, пока рядом есть ещё не тронутые равные звенья.
         """
         if number in self._ladders:
             return self._ladders[number]
-        result = self.results.get(number)
-        steps = []
-        if result is not None and not result.error and result.used_elements:
-            weak = min(result.used_elements, key=lambda e: (e.z_element, e.name))
-            all_ids = {e.get('equipment_id') for e in (self._payload or [])
-                       if e.get('equipment_id')}
-            probe = self._simulate(number, all_ids).result if all_ids else None
-            if probe is not None and abs(probe - result.result) <= 1e-9:
-                # Замена всех учитываемых деталей не изменила срок — методика
-                # считает ресурс по оборудованию, а не по износу деталей.
-                steps = [{'element': weak, 'parts': _counted_parts(weak),
-                          'before': result.result, 'after': result.result,
-                          'gain': 0.0, 'stuck': True, 'parts_ineffective': True}]
-            else:
-                renewed, seen = set(), set()
-                for _ in range(EXTENSION_STEPS):
-                    sim = self._simulate(number, renewed)
-                    if sim.error or not sim.used_elements:
-                        break
-                    weak = min(sim.used_elements, key=lambda e: (e.z_element, e.name))
-                    parts = _pick_parts(weak)
-                    if weak.equipment_id in seen:
-                        steps.append({'element': weak, 'parts': [],
-                                      'before': sim.result, 'after': sim.result,
-                                      'gain': 0.0, 'stuck': True})
-                        break
-                    seen.add(weak.equipment_id)
-                    renewed.add(weak.equipment_id)
-                    after = self._simulate(number, renewed).result
-                    gain = after - sim.result
-                    tied = any(e.equipment_id not in seen
-                               and e.z_element <= sim.result + WEAK_LINK_TOLERANCE
-                               for e in sim.used_elements)
-                    steps.append({'element': weak, 'parts': parts,
-                                  'before': sim.result, 'after': after,
-                                  'gain': gain, 'stuck': gain <= 0 and not tied})
-                    if gain <= 0 and not tied:
-                        break
+        limit = extension_step_limit(self._payload)
+        self._ladder_limit[number] = limit
+        steps = build_extension_ladder(number, self._payload, self.params,
+                                       self._coefficients_now,
+                                       self.results.get(number), limit)
         self._ladders[number] = steps
         return steps
 
@@ -945,17 +1123,33 @@ class AlgorithmsWindow:
 
         first = steps[0]
         if first.get('parts_ineffective'):
-            head.config(text=f'{num(PART_NORM_YEARS, 0)}-летние детали не входят '
-                             f'в эту методику — их замена срок не двигает')
+            if first.get('no_parts'):
+                head.config(text=f'в расчёте нет запчастей с нормой '
+                                 f'{num(PART_NORM_YEARS, 0)} лет — менять по '
+                                 f'этой методике нечего')
+            elif first.get('weak_without_parts'):
+                head.config(text=f'срок держит «{first["element"].name[:40]}»: '
+                                 f'заменяемых запчастей с нормой '
+                                 f'{num(PART_NORM_YEARS, 0)} лет у него нет — '
+                                 f'менять нечего')
+            else:
+                head.config(text='замена запчастей срок не двигает — его держит '
+                                 'назначенный срок службы, а не износ запчастей')
         elif first['gain'] > 0:
-            head.config(text=f'замена «{first["element"].name[:40]}» даёт '
-                             f'+{years_to_text(first["gain"])}')
+            head.config(text=_step_head_text(first))
         else:
-            reach = steps[-1]['after'] - result.result
-            head.config(text=f'слабых звеньев сразу несколько: по одному с '
-                             f'+{years_to_text(reach)} всего')
+            reach = max(step['after'] for step in steps) - result.result
+            if reach > 1e-9:
+                head.config(text=f'слабых звеньев сразу несколько: меняем '
+                                 f'запчасти по условию, всего '
+                                 f'+{years_to_text(reach)}')
+            else:
+                head.config(text='замена запчастей срок не двигает — его держит '
+                                 'назначенный срок службы, а не износ запчастей')
 
-        goal = result.result + target
+        # Ползунок задаёт нужный срок от сегодняшнего дня, а не прибавку к
+        # текущему: «продлить на 3 года» — чтобы от сегодня оставалось 3 года.
+        goal = target
         needed, reach = [], result.result
         for step in steps:
             if reach >= goal - 1e-9:
@@ -980,37 +1174,80 @@ class AlgorithmsWindow:
 
         if target <= 0:
             self.ext_targets[number].config(
-                text=f'Сейчас {years_to_text(result.result)} — сдвиньте ползунок, '
-                     f'чтобы увидеть, что менять', fg=SUB)
-            hint.config(text='Продление считается заменой ближайшего слабого звена: '
-                             'по одному элементу за раз, пока не наберётся срок.',
-                        fg=SUB)
+                text=f'Сейчас срок {years_to_text(result.result)} — сдвиньте '
+                     f'ползунок, чтобы увидеть, что менять', fg=SUB)
+            hint.config(text='Продление считается заменой запчастей слабого звена: '
+                             'сначала самые изношенные, по одной за раз, пока не '
+                             'наберётся срок.', fg=SUB)
             fit_table(tree, len(needed))
             return
 
-        if reach >= goal - 1e-9:
+        if result.result >= goal - 1e-9:
+            # Срок и так больше заданного: продлевать нечего, замен не будет.
             self.ext_targets[number].config(
-                text=f'Продлить на {years_to_text(target)} → '
-                     f'{years_to_text(goal)}: замен {len(needed)}', fg=GOOD)
-            hint.config(text=f'Заменами подряд срок дорастает до '
-                             f'{years_to_text(reach)} (было '
-                             f'{years_to_text(result.result)}).', fg=SUB)
+                text=f'Нужно {years_to_text(target)} от сегодня — срок уже '
+                     f'{years_to_text(result.result)}: замен не нужно', fg=GOOD)
+            hint.config(text=f'К {_due_text(goal)} срок ещё не истекает: '
+                             f'ближайшая замена — '
+                             f'{years_to_text(result.result)} от сегодня.', fg=SUB)
+        elif reach >= goal - 1e-9:
+            self.ext_targets[number].config(
+                text=f'Нужно {years_to_text(target)} от сегодня '
+                     f'(до {_due_text(goal)}): замен {len(needed)}', fg=GOOD)
+            hint.config(text=f'Сейчас срок {years_to_text(result.result)}, '
+                             f'после этих замен — {years_to_text(reach)}.', fg=SUB)
         else:
             gained = max(0.0, reach - result.result)
             self.ext_targets[number].config(
-                text=f'На {years_to_text(target)} не хватает: максимум '
-                     f'+{years_to_text(gained)}', fg=WARN)
-            hint.config(
-                text=(f'{algo_label(number)} считает ресурс оборудования до полной '
-                      f'проверки ({num(FULL_CHECK_TERM, 0)} лет) и не зависит от '
-                      f'износа деталей: замена деталей его срок не двигает. '
-                      f'Продление возможно только заменой оборудования целиком.')
-                if steps[0].get('parts_ineffective') else
-                (f'Больше продлить нельзя: слабыми оказались все элементы, '
-                 f'последняя замена выводит срок на {years_to_text(reach)}. '
-                 f'Дальше растёт уже не ресурс, а необходимость менять '
-                 f'оборудование целиком.'),
-                fg=SUB)
+                text=f'Нужно {years_to_text(target)} от сегодня, но замены '
+                     f'дают максимум {years_to_text(reach)} '
+                     f'(+{years_to_text(gained)})', fg=WARN)
+            # Собственного срока у оборудования нет, поэтому «менять
+            # оборудование целиком» здесь предлагать нечего: предел задают
+            # запчасти и срок полной проверки.
+            limit = self._ladder_limit.get(number) or 0
+            # Обрыв по лимиту — это когда шагов набралось ровно столько,
+            # сколько разрешено, и последний из них ещё двигал срок. Шаг без
+            # прироста означает, что лестница остановилась сама: заменять
+            # больше нечего.
+            capped = limit and len(steps) >= limit and not steps[-1].get('stuck')
+            if steps[0].get('parts_ineffective'):
+                if steps[0].get('no_parts'):
+                    hint.config(
+                        text=f'В расчёте нет заменяемых запчастей с нормой '
+                             f'{num(PART_NORM_YEARS, 0)} лет — срок считается по '
+                             f'оборудованию. Заведите запчасти во вкладке '
+                             f'«Запчасти»: тогда продление будет считаться по '
+                             f'ним.', fg=SUB)
+                elif steps[0].get('weak_without_parts'):
+                    hint.config(
+                        text=f'Срок держит «{steps[0]["element"].name[:40]}»: '
+                             f'заменяемых запчастей с нормой '
+                             f'{num(PART_NORM_YEARS, 0)} лет у него нет, поэтому '
+                             f'замена запчастей срок не поднимает. Дальше срок '
+                             f'назначается диагностированием: T диагн. = '
+                             f'{years_to_text(result.next_diagnosis)}.', fg=SUB)
+                else:
+                    hint.config(
+                        text=f'Замена запчастей срок не двигает: он упирается в '
+                             f'назначенный срок службы, а не в износ запчастей. '
+                             f'Дальше срок назначается диагностированием: '
+                             f'T диагн. = {years_to_text(result.next_diagnosis)}.',
+                        fg=SUB)
+            elif capped:
+                # Лестницу оборвал не расчёт, а её собственный предел: замен
+                # потребовалось больше, чем помещается в список.
+                hint.config(
+                    text=f'Показаны первые {len(steps)} замен — дальше список '
+                         f'не считаем. Изношенных запчастей больше, и каждая '
+                         f'следующая добавляет всё меньше.', fg=SUB)
+            else:
+                hint.config(
+                    text=f'Больше продлить нельзя: слабыми оказались все '
+                         f'элементы, последняя замена выводит срок на '
+                         f'{years_to_text(reach)}. Дальше срок упирается не в '
+                         f'износ элементов, а в назначенные сроки службы — '
+                         f'замены запчастей его не поднимают.', fg=SUB)
         fit_table(tree, len(needed))
 
     # ----------------------------------------------- Элементы и коэффициенты
@@ -1116,9 +1353,14 @@ justify=tk.LEFT, wraplength=1400)
     # ------------------------------------------------------- Срок замены
 
     def _build_horizon_tab(self):
-        """Ползунок горизонта 0-5 лет и список того, что к нему истекает."""
-        wrap = tk.Frame(self.tab_horizon, bg=BG)
-        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        """Ползунок горизонта 0-5 лет и список того, что к нему истекает.
+
+        Вкладка прокручивается целиком: на невысоком окне ползунок, подпись и
+        таблица вместе выше экрана, и без прокрутки низ списка было не достать.
+        """
+        pane = Pane(self.tab_horizon)
+        pane.pack(fill=tk.BOTH, expand=True)
+        wrap = pane.body
 
         top = card(wrap)
         top.pack(fill=tk.X)
@@ -1150,18 +1392,17 @@ justify=tk.LEFT, wraplength=1400)
         self.horizon_count.pack(side=tk.LEFT, padx=(20, 0))
 
         box = card(wrap)
-        box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        box.pack(fill=tk.X, pady=(12, 0))
         self.tree_horizon = table(
             box,
-            columns=('Элемент', 'Тип', 'Деталь', 'Норма детали', 'Возраст детали',
-                     'Осталось детали', 'Осталось элемента', 'К замене'),
-            widths={'Элемент': 290, 'Тип': 110, 'Деталь': 300, 'Норма детали': 105,
-                    'Возраст детали': 115, 'Осталось детали': 125,
-                    'Осталось элемента': 140, 'К замене': 105},
+            columns=('Элемент', 'Тип', 'Запчасть', 'Норма запчасти', 'Возраст запчасти',
+                     'Осталось запчасти', 'Осталось элемента'),
+            widths={'Элемент': 290, 'Тип': 110, 'Запчасть': 300, 'Норма запчасти': 105,
+                    'Возраст запчасти': 115, 'Осталось запчасти': 125,
+                    'Осталось элемента': 140},
             height=12,
         )
-        for tag, color in (('good', TINT_GOOD), ('warn', TINT_WARN),
-                           ('bad', TINT_BAD)):
+        for tag, color in (('warn', TINT_WARN), ('bad', TINT_BAD)):
             self.tree_horizon.tag_configure(tag, background=color)
 
     def _on_horizon_algorithm(self, _event=None):
@@ -1195,6 +1436,7 @@ justify=tk.LEFT, wraplength=1400)
             self.horizon_count.config(
                 text=result.error if result else 'методика не рассчитана', fg=BAD)
             self.horizon_slider.set_level('none')
+            fit_table(tree, 0)
             return
 
         due, later = [], []
@@ -1209,16 +1451,17 @@ justify=tk.LEFT, wraplength=1400)
                 years_to_text(part.get('age')) if part else '—',
                 years_to_text(part_z) if part_z is not None else '—',
                 years_to_text(element.z_element),
-                'да' if element.z_element <= horizon else 'нет',
             )
             (due if element.z_element <= horizon else later).append(
                 (element, part, part_z, row))
 
         due.sort(key=lambda item: (item[0].z_element, item[0].name))
         later.sort(key=lambda item: (item[0].z_element, item[0].name))
-        for element, _part, _z, row in due + later:
-            tag = ('bad' if element.z_element <= 0
-                   else 'warn' if element.z_element <= horizon else 'good')
+        # В таблице — только то, что истекает в пределах горизонта: элемент,
+        # чей срок дальше, к намеченной дате менять не нужно, и в списке замен
+        # он только мешает. Сколько таких осталось, сказано в подписи ниже.
+        for element, _part, _z, row in due:
+            tag = 'bad' if element.z_element <= 0 else 'warn'
             tree.insert('', tk.END, tags=(tag,), values=row)
 
         total = len(result.used_elements)
@@ -1238,72 +1481,61 @@ justify=tk.LEFT, wraplength=1400)
             self.horizon_slider.set_level('some')
             text = (f'к {_horizon_text(horizon)} истекает: {len(due)} из {total} '
                     f'элементов ({len({e.equipment_id for e, _, _, _ in due})}'
-                    f' ед. оборудования)')
+                    f' ед. оборудования); остальные {len(later)} — позже')
             color = WARN
         self.horizon_count.config(text=text, fg=color)
+        # Высота таблицы по числу строк: вкладка прокручивается целиком, и
+        # длинный список должен быть доступен по прокрутке страницы.
+        fit_table(tree, len(due), minimum=4, cap=24)
 
     # -------------------------------------------------------- Коэффициенты
 
     def _build_coefficients_tab(self):
-        wrap = tk.Frame(self.tab_coefficients, bg=BG)
-        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        """Коэффициенты: редактируемые веса и как они превратились в K_..
+
+        Вкладка прокручивается целиком: полей стало больше (веса, ручные K,
+        кнопка и таблица по элементам), и на невысоком окне низ не помещался.
+        """
+        pane = Pane(self.tab_coefficients)
+        pane.pack(fill=tk.BOTH, expand=True)
+        wrap = pane.body
+
+        editor = card(wrap)
+        editor.pack(fill=tk.X, pady=(0, 12))
+        self._build_params_panel(editor)
+
         box = card(wrap)
-        box.pack(fill=tk.BOTH, expand=True)
+        box.pack(fill=tk.X)
+        head = head_row(box, padx=18)
+        card_title(head, 'Как получились коэффициенты по каждому элементу').pack(
+            side=tk.LEFT)
+        self._coeff_note = note(
+            box, 'K сост, K эксл, K рем и k повр — поправки, на которые '
+                 'умножается базовый ресурс. Где данных нет, коэффициент равен 1 '
+                 'и ресурс не снижается.', padx=18, pady=(2, 6), fill=tk.X)
 
         self.tree_coefficients = table(
             box,
-            columns=('Элемент', 'Категория', 'S_нач', 'Возраст', 'Z_база', 'Вариант',
-                     'K_сост', 'K_эксл', 'K_рем', 'k_повр', 'Z_эл', 'Формула Z_эл'),
-            widths={'Элемент': 235, 'Категория': 160, 'S_нач': 80, 'Возраст': 88,
-                    'Z_база': 78, 'Вариант': 68, 'K_сост': 76, 'K_эксл': 74,
-                    'K_рем': 70, 'k_повр': 74, 'Z_эл': 82, 'Формула Z_эл': 300},
-            height=16,
+            columns=('Элемент', 'Категория', 'Норма, лет', 'Возраст, лет', 'База Z',
+                     'Вариант базы', 'K сост', 'K эксл', 'K рем', 'k повр',
+                     'Ресурс Z', 'Расчёт (формула)'),
+            widths={'Элемент': 235, 'Категория': 140, 'Норма, лет': 82,
+                    'Возраст, лет': 90, 'База Z': 78, 'Вариант базы': 68,
+                    'K сост': 76, 'K эксл': 74, 'K рем': 70, 'k повр': 74,
+                    'Ресурс Z': 82, 'Расчёт (формула)': 300},
+            height=13,
         )
         self.tree_coefficients.tag_configure('weak', background=TINT_BAD)
         self.tree_coefficients.tag_configure('skip', background=TINT_SKIP,
                                              foreground=SUB)
         self.tree_coefficients.tag_configure('zero', background=TINT_WARN)
-
-    # ------------------------------------------------------------ Трассировка
-
-    def _build_trace_tab(self):
-        wrap = tk.Frame(self.tab_trace, bg=BG)
-        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
-        box = card(wrap)
-        box.pack(fill=tk.BOTH, expand=True)
-
-        bar = tk.Frame(box, bg=CARD)
-        bar.pack(fill=tk.X, padx=18, pady=(12, 0))
-        card_title(bar, 'Пошаговый расчёт').pack(side=tk.LEFT)
-        _btn(bar, 'Скопировать', self._copy_trace,
-             color='muted').pack(side=tk.RIGHT)
-
-        self.text_trace = _text_block(box, height=30)
-        for level, (color, bold, italic) in TRACE_COLORS.items():
-            self.text_trace.tag_configure(
-                level, foreground=color,
-                font=('Consolas', 11, 'bold') if bold
-                else ('Consolas', 11, 'italic') if italic
-                else ('Consolas', 11),
-            )
-        self.text_trace.tag_configure('element', foreground='#7b3fa0',
-                                      font=('Consolas', 11, 'bold'))
-
-    def _copy_trace(self):
-        text = self.text_trace.get('1.0', tk.END)
-        self.window.clipboard_clear()
-        self.window.clipboard_append(text)
-        messagebox.showinfo('Скопировано', 'Трассировка расчёта скопирована в буфер обмена')
+        self.tree_coefficients.tag_configure('manual', background=TINT_MANUAL)
 
     # ------------------------------------------------------- Исходные данные
 
     def _build_inputs_tab(self):
         wrap = tk.Frame(self.tab_inputs, bg=BG)
         wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
-
-        params_card = card(wrap)
-        params_card.pack(fill=tk.X, pady=(0, 12))
-        self._build_params_panel(params_card)
 
         journal_card = card(wrap)
         journal_card.pack(fill=tk.X, pady=(0, 12))
@@ -1315,10 +1547,10 @@ justify=tk.LEFT, wraplength=1400)
             anchor=tk.W, padx=18, pady=(12, 4))
         self.tree_inputs = table(
             box,
-            columns=('Элемент', 'Категория', 'S_нач', 'Источник', 'Детали',
+            columns=('Элемент', 'Категория', 'S_нач', 'Источник', 'Запчасти',
                      'Z_база', 'Отказы', 'Повреж.', 'Ремонт', 'В расчёте'),
             widths={'Элемент': 230, 'Категория': 165, 'S_нач': 85, 'Источник': 170,
-                    'Детали': 70, 'Z_база': 80, 'Отказы': 65, 'Повреж.': 75,
+                    'Запчасти': 70, 'Z_база': 80, 'Отказы': 65, 'Повреж.': 75,
                     'Ремонт': 140, 'В расчёте': 200},
             height=9,
         )
@@ -1327,42 +1559,82 @@ justify=tk.LEFT, wraplength=1400)
         self.tree_inputs.tag_configure('weak', background=TINT_BAD)
 
     def _build_params_panel(self, parent):
+        """Редактор весов методики и ручных поправок K."""
         head = head_row(parent, padx=18)
-        card_title(head, 'Весовые коэффициенты методики').pack(side=tk.LEFT)
+        card_title(head, 'Коэффициенты методики').pack(side=tk.LEFT)
+        _btn(head, 'Вернуть методические', self._reset_params,
+             color='muted').pack(side=tk.RIGHT)
 
         body = tk.Frame(parent, bg=CARD)
-        body.pack(fill=tk.X, padx=18, pady=(10, 16))
+        body.pack(fill=tk.X, padx=18, pady=(8, 16))
 
-        fields = [
-            ('alpha_fail', 'α — вес отказа', 2),
-            ('beta_damage', 'β — вес повреждения', 2),
-            ('theta_conditions', 'θ — условия эксплуатации', 2),
-            ('delta_repair', 'δ — качество ремонта', 2),
-            ('reserve', 'K запаса', 2),
-            ('max_diag_interval', 'T макс. диагностики', 1),
-        ]
+        note(body, 'Веса управляют поправками K сост, K эксл, K рем и k повр: '
+                   'изменение пересчитывает все методики сразу. Все '
+                   'коэффициенты принимаются от 0 до 1.',
+             fill=tk.X, pady=(0, 10))
+
         self._param_entries = {}
-        self._param_digits = {attr: digits for attr, _, digits in fields}
-        for row, (attr, label, _) in enumerate(fields):
-            column = row % 4
-            block = tk.Frame(body, bg=CARD)
-            block.grid(row=row // 4, column=column, sticky=tk.W,
-                       padx=(0, 24), pady=6)
-            tk.Label(block, text=label, bg=CARD, fg=TEXT,
-                     font=F_BODY).pack(anchor=tk.W)
-            entry = ttk.Entry(block, width=9, font=('Consolas', 11),
-                              style='Calc.TEntry', justify=tk.RIGHT)
-            entry.insert(tk.END, num(getattr(self.params, attr),
-                                     self._param_digits[attr]))
-            entry.pack(anchor=tk.W, pady=(4, 0))
-            self._param_entries[attr] = entry
+        self._param_specs = {}
+
+        grid = self._param_grid(body)
+        for row, (attr, label, digits, purpose, lo, hi) in enumerate(WEIGHT_FIELDS):
+            self._add_param_cell(grid, row, attr, label, digits, purpose, lo, hi,
+                                 getattr(self.params, attr), manual=False)
+
+        note(body, 'Ручные поправки K (0…1). Пустое поле — коэффициент считается '
+                   'по формуле методики; заполненное — берётся введённое '
+                   'значение, и в расчёте оно помечается «задано вручную».',
+             fill=tk.X, pady=(12, 6))
+
+        manual_grid = self._param_grid(body)
+        for row, (attr, label, purpose) in enumerate(MANUAL_FIELDS):
+            self._add_param_cell(manual_grid, row, attr, label, 3, purpose,
+                                 0.0, 1.0, getattr(self.params, attr),
+                                 manual=True)
+
+        self._params_message = tk.Label(body, text='', bg=CARD, fg=BAD,
+                                        font=F_BODY, anchor=tk.W,
+                                        justify=tk.LEFT)
+        self._params_message.pack(fill=tk.X, pady=(10, 0))
 
         actions = tk.Frame(body, bg=CARD)
-        actions.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(14, 0))
+        actions.pack(fill=tk.X, pady=(8, 0))
         _btn(actions, 'Пересчитать с этими коэффициентами',
              self._apply_params, color='success').pack(side=tk.LEFT)
-        _btn(actions, 'Вернуть методические значения',
-             self._reset_params, color='muted').pack(side=tk.LEFT, padx=10)
+
+    @staticmethod
+    def _param_grid(parent):
+        """Сетка полей в две колонки — общая для весов и ручных поправок."""
+        grid = tk.Frame(parent, bg=CARD)
+        grid.pack(fill=tk.X)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+        return grid
+
+    def _add_param_cell(self, grid, row, attr, label, digits, purpose, lo, hi,
+                        value, manual):
+        """Одно поле коэффициента: подпись, ввод, диапазон, назначение."""
+        column = row % 2
+        cell = tk.Frame(grid, bg=CARD)
+        cell.grid(row=row // 2, column=column, sticky='ew',
+                  padx=(0, 20) if column == 0 else (20, 0), pady=5)
+        top = tk.Frame(cell, bg=CARD)
+        top.pack(fill=tk.X)
+        tk.Label(top, text=label, bg=CARD, fg=TEXT, font=F_TABLE_B,
+                 width=16, anchor=tk.W).pack(side=tk.LEFT)
+        entry = ttk.Entry(top, width=8, font=('Consolas', 11),
+                          style='Calc.TEntry', justify=tk.RIGHT)
+        initial = _manual_text(value) if manual else (
+            num(value, digits) if value is not None else '')
+        entry.insert(tk.END, initial)
+        entry.pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(top, text=_range_text(lo, hi), bg=CARD, fg=SUB,
+                 font=F_BODY).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(cell, text=purpose, bg=CARD, fg=SUB, font=F_BODY,
+                 anchor=tk.W).pack(fill=tk.X, pady=(2, 0))
+        self._param_entries[attr] = entry
+        self._param_specs[attr] = {'label': label, 'digits': digits, 'lo': lo,
+                                   'hi': hi, 'manual': manual}
 
     def _build_journal_panel(self, parent):
         head = head_row(parent, padx=18)
@@ -1376,107 +1648,64 @@ justify=tk.LEFT, wraplength=1400)
                                       anchor=tk.W)
         self._journal_text.pack(fill=tk.X)
 
-    def _read_params(self) -> AlgorithmParams:
-        """Читает коэффициенты из полей; некорректное значение игнорируется.
+    def _read_params(self):
+        """Читает коэффициенты из полей. Возвращает (params, ошибки, поля).
 
         В основу берётся текущий self.params, а не новый экземпляр: так
-        нераспознанное поле не сбрасывает остальные на методические значения.
+        незаполненное поле ручной поправки возвращает формулу методики, не
+        сбрасывая остальные значения. Значение вне 0…1 не принимается —
+        возвращается текст ошибки и само поле, чтобы его подсветить.
         """
         base = copy.deepcopy(self.params)
-        for attr, entry in self._param_entries.items():
-            raw = entry.get().replace(',', '.').strip()
-            try:
-                setattr(base, attr, float(raw))
-            except ValueError:
-                pass
-        return base
+        errors, bad = [], []
+        for attr, spec in self._param_specs.items():
+            entry = self._param_entries[attr]
+            value, error = parse_coefficient(entry.get(), spec['label'],
+                                             spec['lo'], spec['hi'],
+                                             allow_empty=spec['manual'])
+            if error:
+                errors.append(error)
+                bad.append(entry)
+                continue
+            if value is None:
+                if spec['manual']:
+                    setattr(base, attr, None)
+                continue
+            setattr(base, attr, value)
+        return base, errors, bad
+
+    def _mark_bad_params(self, bad):
+        """Подсвечивает поля с ошибкой и снимает подсветку с остальных."""
+        for entry in self._param_entries.values():
+            entry.configure(style='CalcBad.TEntry' if entry in bad
+                            else 'Calc.TEntry')
 
     def _apply_params(self):
-        self.params = self._read_params()
+        params, errors, bad = self._read_params()
+        if errors:
+            # Пока в поле что-то неверное, расчёт не трогаем: иначе на экране
+            # осталось бы старое число без объяснения, почему оно не изменилось.
+            self._mark_bad_params(bad)
+            self._params_message.config(
+                text='Не принято — ' + '; '.join(errors) + '. Расчёт не изменён.')
+            return
+        self._mark_bad_params([])
+        self._params_message.config(text='')
+        self.params = params
         self.calculate_and_display()
 
     def _reset_params(self):
         self.params = AlgorithmParams()
         for attr, entry in self._param_entries.items():
+            spec = self._param_specs[attr]
+            value = getattr(self.params, attr)
+            text = (_manual_text(value) if spec['manual']
+                    else num(value, spec['digits']) if value is not None else '')
             entry.delete(0, tk.END)
-            entry.insert(tk.END, num(getattr(self.params, attr),
-                                     self._param_digits[attr]))
+            entry.insert(tk.END, text)
+        self._mark_bad_params([])
+        self._params_message.config(text='')
         self.calculate_and_display()
-
-    # ------------------------------------------------------------ Методика
-
-    def _build_method_tab(self):
-        wrap = tk.Frame(self.tab_method, bg=BG)
-        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
-        holder = card(wrap)
-        holder.pack(fill=tk.BOTH, expand=True)
-        box = _text_block(holder, height=30, font=('Segoe UI', 11))
-        box.tag_configure('h', foreground=ACCENT, font=('Segoe UI', 13, 'bold'))
-        box.tag_configure('f', foreground='#123a8f', font=('Consolas', 11))
-        box.tag_configure('s', foreground=SUB, font=('Segoe UI', 10))
-
-        def put(text, tag=None):
-            box.insert(tk.END, text, tag)
-
-        put('КАК СЧИТАЕТСЯ ОСТАТОЧНЫЙ РЕСУРС\n', 'h')
-        put('Методика описана пошагово: результат любого элемента можно воспроизвести '
-            'вручную по данным, которые видны во вкладке «Исходные данные».\n\n')
-
-        put('Шаг 1. Отбор критических элементов\n', 'h')
-        put('В расчёт входят только: регулятор давления, ПЗК, ПСК, фильтр, '
-            'запорная арматура. ГРП — последовательная система, отказ любого из них '
-            'останавливает весь пункт.\n\n')
-
-        put('Шаг 2. Базовый ресурс Zбаза — каскад оценок\n', 'h')
-        put('А. По фактической наработке (телеметрия):\n', 'f')
-        put('   Z = (Sнач − Sфакт) / Sнач · Sнач,эл\n\n', 'f')
-        put('Б1. По протоколу диагностики детали:\n', 'f')
-        put('   Zд = Kсост,д · Sнач,д\n\n', 'f')
-        put('Б2. Документальная (экспертная) оценка остаточного ресурса детали:\n', 'f')
-        put('   Zд = Sнач,д − Sфакт,д\n\n', 'f')
-        put('В. Календарный (резервный) вариант при отсутствии деталей:\n', 'f')
-        put('   Z = Sнач − Sфакт\n\n', 'f')
-        put('Ресурс элемента — минимум по его деталям (слабейшая деталь).\n\n')
-
-        put('Шаги 3-6. Поправки\n', 'h')
-        put('Kсост = 1 − (1/n) · Σ |Δij| / Допускij\n', 'f')
-        put('Kэксл = 1 − θ · (1 − Услфакт / Услнорм)\n', 'f')
-        put('Kрем  = 1 − δ · (1 − Ремфакт / Ремнорм);  замена на новое → 1, '
-            'некачественный ремонт → 0,9\n', 'f')
-        put('kповр = max(0; 1 − α·Nотказ − β·Nповрежд)\n\n', 'f')
-        put('Если данных нет — коэффициент принимается равным 1, и это обязательно '
-            'показывается в трассировке.\n\n')
-
-        put('Шаг 7. Некратные замены\n', 'h')
-        put('Сумма израсходованного ресурса замен Σ (Sфакт,д / Sнач,д): если она меньше 1, '
-            'ресурс деталей не исчерпан, в трассировке это отмечается отдельной строкой.\n\n')
-
-        put('Шаг 8. Ресурс элемента\n', 'h')
-        put('Zэл = Zбаза · Kсост · Kэксл · Kрем · kповр\n\n', 'f')
-
-        put('Шаги 9-11. Итог по ГРП\n', 'h')
-        weak_link_algos = ', '.join(algo_label(n) for n in WEAK_LINK_ALGORITHMS)
-        put(f'{weak_link_algos}:  ZГРП = min (Zрег; Zпзк; Zпск; Zфильтр; Zарматура)\n',
-            'f')
-        put(f'{algo_label(0)}:  ZГРП = Σ Zэл / m      (среднее арифметическое)\n', 'f')
-        put(f'{algo_label(1)}:  ZГРП = (Σ Zэл / m) · Kобщ,  '
-            'Kобщ = 1 − (A + B + C)\n', 'f')
-        put(f'{algo_label(4)}:  Zбаза = Zкаленд = Sнач − Sфакт (срок полной проверки '
-            'минус возраст оборудования)\n', 'f')
-        put('Взвешивание с фактической наработкой (α·Zкаленд + (1−α)·Zнаработка) '
-            'не применяется: телеметрии по элементам нет.\n', 's')
-        put('Tдиагн = min (ZГРП · Kзапаса ; Tмакс)\n\n', 'f')
-
-        put('ИСТОЧНИКИ (папка docs/)\n', 'h')
-        put('Нумерация методик в приложении своя (1-5) и не совпадает с '
-            'нумерацией в исходных документах (1-4). Соответствие:\n', 's')
-        for _n in range(5):
-            put(f'{algo_label(_n)} — {ALGORITHM_TITLES[_n]}: {algo_source(_n)}\n', 's')
-        put('«Методика оценки фактической наработки отключающего устройства на входе.docx» '
-            '— правила учёта наработки.\n', 's')
-        put('«Методика определения назначенных показателей долговечности элементов ГРП '
-            'при отсутствии нормативных данных производителя.docx» — правила нормативов.\n', 's')
-        box.config(state=tk.DISABLED)
 
     # ------------------------------------------------------------- Расчёт
 
@@ -1492,7 +1721,7 @@ justify=tk.LEFT, wraplength=1400)
             )
             self._payload = payload
             self._coefficients_now = coefficients
-            self._ladders = {}
+            self._ladders, self._ladder_limit = {}, {}
         except Exception as exc:  # noqa: BLE001 — окно не должно падать
             messagebox.showerror('Ошибка расчёта', f'Не удалось выполнить расчёт:\n{exc}')
             return
@@ -1505,7 +1734,6 @@ justify=tk.LEFT, wraplength=1400)
             self._render_algorithm_pane(number)
         self.render_horizon()
         self.render_coefficients()
-        self.render_trace()
         self._render_inputs()
         self._render_journal_card(coefficients)
         self._update_header()
@@ -1538,7 +1766,7 @@ justify=tk.LEFT, wraplength=1400)
                 elif record['total']:
                     equip['repair'] = {'quality': 'new'}
                 # Дата последней замены по этому элементу: от неё считается
-                # возраст заменяемых деталей без собственной даты установки.
+                # возраст заменяемых запчастей без собственной даты установки.
                 equip['replaced_on'] = (_last_replacement_on({'x': record})
                                         or grp_renewed)
             else:
@@ -1552,7 +1780,7 @@ justify=tk.LEFT, wraplength=1400)
                 'фильтр, запорная арматура) — проверьте наименования в справочнике.')
         if not any(e['details'] for e in payload):
             warnings.append(
-                'Нет данных о деталях и нормативных сроках службы. Заведите запчасти '
+                'Нет данных о запчастях и нормативных сроках службы. Заведите запчасти '
                 'с нормами (вкладка «Запчасти») или укажите срок службы вручную — '
                 'иначе используется упрощённый календарный вариант.')
         if not coefficients:
@@ -1574,20 +1802,20 @@ justify=tk.LEFT, wraplength=1400)
                     if d.get('is_replaceable') and not d.get('install_date'))
         if dated and grp_renewed:
             warnings.append(
-                f'У {dated} заменяемых деталей не указана дата установки — принята '
+                f'У {dated} заменяемых запчастей не указана дата установки — принята '
                 f'дата последней замены по ГРП ({grp_renewed}). Укажите дату в '
-                f'вкладке «Запчасти», если деталь менялась отдельно.')
+                f'вкладке «Запчасти», если запчасть менялась отдельно.')
         return payload, warnings, journal
 
     def _load_details(self, equip, warnings):
-        """Активные детали элемента для варианта Б2 базового ресурса."""
+        """Активные запчасти элемента для варианта Б2 базового ресурса."""
         eq_id = equip.get('equipment_id')
         if eq_id is None:
             return []
         try:
             rows = self.db.get_equipment_parts_full(eq_id) or []
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f'Не удалось загрузить детали «{equip["name"]}»: {exc}')
+            warnings.append(f'Не удалось загрузить запчасти «{equip["name"]}»: {exc}')
             return []
 
         details = []
@@ -1597,11 +1825,11 @@ justify=tk.LEFT, wraplength=1400)
             if removal_date or not norm_years or float(norm_years) <= 0:
                 continue
             details.append({
-                'name': row[2] or 'Деталь',
+                'name': row[2] or 'Запчасть',
                 'norm_years': float(norm_years),
-                # Своя дата установки детали: если её нет, расчёт берёт дату
+                # Своя дата установки запчасти: если её нет, расчёт берёт дату
                 # последней замены из журнала, а подставлять сюда дату
-                # оборудования нельзя — деталь с 5-летней нормой выглядела бы
+                # оборудования нельзя — запчасть с 5-летней нормой выглядела бы
                 # просроченной на все годы эксплуатации ГРП.
                 'install_date': install_date,
                 'equip_install_date': equip.get('install_date'),
@@ -1683,7 +1911,7 @@ justify=tk.LEFT, wraplength=1400)
 
         if overdue:
             self.warnings.append(
-                f'Нормативный срок отработан деталями ({len(overdue)}): '
+                f'Нормативный срок отработан запчастями ({len(overdue)}): '
                 + ', '.join(overdue[:4])
                 + ('…' if len(overdue) > 4 else '')
                 + ' — их ресурс принят равным нулю.')
@@ -1753,15 +1981,33 @@ justify=tk.LEFT, wraplength=1400)
             text=f'{self.grp_name}  ·  элементов в расчёте: {used}'
                  f'  ·  методика: {algo_label(PRIMARY_ALGORITHM)}')
 
+    def _manual_summary(self):
+        """Подпись под таблицей коэффициентов: посчитаны они или заданы."""
+        values = self.params.manual_values()
+        if not values:
+            return ('K сост, K эксл, K рем и k повр — поправки, на которые '
+                    'умножается базовый ресурс. Где данных нет, коэффициент равен 1 '
+                    'и ресурс не снижается.')
+        listed = ', '.join(f'{name} = {num(value, 3)}'
+                           for name, _label, value in values)
+        return (f'Задано вручную — {listed}: формулы методики для этих поправок '
+                f'не применяются. Остальные K считаются по методике, и где данных '
+                f'нет, коэффициент равен 1.')
+
     def render_coefficients(self):
         """Таблица коэффициентов по элементам выбранного алгоритма."""
         tree = self.tree_coefficients
         tree.delete(*tree.get_children())
+        self._coeff_note.config(text=self._manual_summary())
         result = self._result(self._algo_var.get())
         if result is None:
+            self.algo_hint.config(text='')
+            fit_table(tree, 0)
             return
         if result.error:
             tree.insert('', tk.END, values=(result.error,) + ('',) * 11)
+            self.algo_hint.config(text=result.error)
+            fit_table(tree, 0)
             return
 
         weak = result.weak_element
@@ -1772,7 +2018,10 @@ justify=tk.LEFT, wraplength=1400)
                     '—', '—', '—', '—', '—', 'не входит в расчёт'))
                 continue
             tag = 'weak' if element.name == weak else ('zero' if element.z_element <= 0 else '')
-            tree.insert('', tk.END, tags=(tag,) if tag else (), values=(
+            # Голубым помечаем строки с ручными K — но только там, где нет
+            # цветовой метки по ресурсу: она важнее и не должна перекрываться.
+            tags = (tag,) if tag else (('manual',) if element.k_manual else ())
+            tree.insert('', tk.END, tags=tags, values=(
                 element.name,
                 critical_title(element.critical_key) if element.critical_key else '—',
                 years_to_text(element.norm),
@@ -1787,29 +2036,12 @@ justify=tk.LEFT, wraplength=1400)
                 element.z_element_formula,
             ))
 
-    def render_trace(self):
-        """Пошаговая трассировка выбранного алгоритма."""
-        box = self.text_trace
-        box.config(state=tk.NORMAL)
-        box.delete('1.0', tk.END)
-        result = self._result(self._algo_var.get())
-        if result is None:
-            box.config(state=tk.DISABLED)
-            return
-
-        for step in result.steps:
-            level = step.level if step.level in TRACE_COLORS else 'value'
-            box.insert(tk.END, step.text + '\n', level)
-            if level == 'title':
-                box.insert(tk.END, '\n')
-
-        if result.error:
-            box.insert(tk.END, '\nРасчёт не выполнен: ' + result.error + '\n', 'warn')
-        box.config(state=tk.DISABLED)
-
+        # Подсказка у выбора методики: она же была в трассировке, которую убрали.
         self.algo_hint.config(
             text=f'в расчёте {len(result.used_elements)} элементов'
-                 + (f', слабое звено — {result.weak_element}' if result.weak_element else ''))
+                 + (f', слабое звено — {result.weak_element}'
+                    if result.weak_element else ''))
+        fit_table(tree, len(result.elements), minimum=4, cap=24)
 
     def _render_inputs(self):
         """Что именно поступило в расчёт и чего не хватило."""
@@ -1842,7 +2074,7 @@ justify=tk.LEFT, wraplength=1400)
 
             in_calc = 'да'
             if element is None:
-                in_calc = 'нет: нет нормы и деталей'
+                in_calc = 'нет: нет нормы и запчастей'
             elif not element.used:
                 in_calc = f'нет: {element.skip_reason}'
 

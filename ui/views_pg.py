@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from core.config import DB_CONFIG
-from core.lifetimes import part_remaining
+from core import grp_passport
 from core.models import Equipment
 from core.timefmt import DurationError, parse_years_strict, years_to_text
 from db.database_pg import DatabasePG
@@ -46,20 +46,6 @@ BTN_COLORS = {
     'neutral': ('#607D8B', '#455A64'),
 }
 
-# Соответствие цветов предыдущего интерфейса → стиль
-OLD_COLORS = {
-    '#4CAF50': 'success',
-    '#FF9800': 'warning',
-    '#F44336': 'danger',
-    '#f44336': 'danger',
-    '#2196F3': 'primary',
-    '#00BCD4': 'info',
-    '#9C27B0': 'purple',
-    '#673AB7': 'indigo',
-    '#795548': 'brown',
-    '#607D8B': 'neutral',
-}
-
 # Меню слева: (заголовок группы, [(пункт, команда, доступность)]).
 # доступность: 'always' — всегда активен, 'grp' — только при выбранном ГРП.
 MENU_STRUCTURE = [
@@ -85,6 +71,47 @@ MENU_STRUCTURE = [
         ("📤 Обновить файл Excel", "sync_excel", "always"),
     ]),
 ]
+
+
+# ------------------------------------------------------------------ форма ГРП
+
+def _grp_passport_form(frame, start_row: int, values: dict = None,
+                       columns: int = 2):
+    """Поля паспорта ГРП в сетке формы → {ключ: виджет}.
+
+    Двенадцать полей в один столбец не помещаются на экран ноутбука, а форма
+    должна читаться целиком, без прокрутки, — поэтому в две колонки.
+    Подписи, порядок и виды полей берутся из core.grp_passport: оттуда же их
+    берёт таблица «Сведения о ГРП» в отчёте, поэтому форма и отчёт не
+    разъедутся.
+    """
+    values = values or {}
+    fields = list(grp_passport.FORM_FIELDS)
+    per_column = -(-len(fields) // columns)      # округление вверх
+    widgets = {}
+    for index, (key, label, kind) in enumerate(fields):
+        column, row = divmod(index, per_column)
+        left = column * 2
+        tk.Label(frame, text=label + ':', font=("Arial", 10),
+                 wraplength=200, justify=tk.LEFT).grid(
+            row=start_row + row, column=left, sticky=tk.W, pady=4)
+        current = values.get(key, '')
+        if kind == 'choice':
+            widget = ttk.Combobox(frame, width=24, state='readonly',
+                                  values=list(grp_passport.COATING_CHOICES))
+            widget.set(current)
+        else:
+            widget = tk.Entry(frame, width=26)
+            widget.insert(0, current)
+        widget.grid(row=start_row + row, column=left + 1, sticky=tk.W,
+                    pady=4, padx=(0, 18))
+        widgets[key] = widget
+    return widgets
+
+
+def _grp_passport_values(widgets) -> dict:
+    """Сведения паспорта из формы: {ключ: строка} — как их принимает база."""
+    return {key: widget.get().strip() for key, widget in widgets.items()}
 
 
 class AutocompleteCombobox(ttk.Combobox):
@@ -145,8 +172,6 @@ class GRPAppPG:
             equip.install_date if hasattr(equip, 'install_date') else None
         )
 
-    _part_remaining_life = staticmethod(part_remaining)
-
     def _btn(self, parent, text, command, color='primary', font_size=9, padx=10, **extra):
         """Единая цветная кнопка интерфейса с эффектом наведения."""
         c1, c2 = BTN_COLORS.get(color, BTN_COLORS['primary'])
@@ -159,10 +184,6 @@ class GRPAppPG:
         btn.bind("<Enter>", lambda e, b=btn, bg=c2: b.config(bg=bg))
         btn.bind("<Leave>", lambda e, b=btn, bg=c1: b.config(bg=bg))
         return btn
-
-    def _btn_to(self, parent, text, command, color='primary', font_size=9, padx=10, **extra):
-        """_btn с компоновкой pack(side=LEFT) — короткая запись."""
-        return self._btn(parent, text, command, color, font_size, padx, **extra).pack(side=tk.LEFT, padx=4, pady=2)
 
     def setup_ui(self):
         self.root.title("🏭 Система анализа ГРП (PostgreSQL)")
@@ -275,10 +296,6 @@ class GRPAppPG:
         for cmd, (btn, scope) in self.menu_buttons.items():
             if scope == 'grp':
                 btn.config(state="normal" if enabled else "disabled")
-
-    def _menu_item(self, cmd: str) -> Optional[tk.Button]:
-        info = self.menu_buttons.get(cmd)
-        return info[0] if info else None
 
     def toggle_sidebar(self):
         """Открыть/закрыть серое меню.
@@ -435,9 +452,12 @@ class GRPAppPG:
         self._btn(equip_buttons, "🗑 Удалить оборудование", self._delete_selected_equipment, color='danger', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
         self._btn(equip_buttons, "🔍 Проверить по нормам", self._check_selected_norm, color='info', font_size=9, padx=10).pack(side=tk.LEFT, padx=4)
 
-        columns = ("ID", "Наименование", "Остаток срока", "Дата установки", "Дата снятия")
+        # Остатка срока в списке нет: собственного срока у оборудования не
+        # бывает, срок задают заменяемые запчасти, а по оборудованию проводится
+        # полная проверка. Видны только даты установки и снятия.
+        columns = ("ID", "Наименование", "Дата установки", "Дата снятия")
         self.home_tree = ttk.Treeview(equip_card, columns=columns, show="headings", height=7)
-        widths = {"ID": 60, "Наименование": 440, "Остаток срока": 150,
+        widths = {"ID": 60, "Наименование": 440,
                   "Дата установки": 120, "Дата снятия": 150}
         for c in columns:
             self.home_tree.heading(c, text=c)
@@ -464,10 +484,10 @@ class GRPAppPG:
         parts_frame = tk.Frame(self.parts_card)
         parts_frame.pack(fill=tk.BOTH, expand=True)
 
-        pcolumns = ("ID", "Запчасть", "Обозначение", "Замен.", "Дата установки / замены", "Остаток")
+        pcolumns = ("ID", "Запчасть", "Обозначение", "Замен.", "Дата установки / замены")
         self.parts_tree = ttk.Treeview(parts_frame, columns=pcolumns, show="headings", height=7)
         pwidths = {"ID": 40, "Запчасть": 280, "Обозначение": 180, "Замен.": 55,
-                   "Дата установки / замены": 160, "Остаток": 120}
+                   "Дата установки / замены": 160}
         for c in pcolumns:
             self.parts_tree.heading(c, text=c)
             self.parts_tree.column(c, width=pwidths.get(c, 100))
@@ -486,7 +506,9 @@ class GRPAppPG:
         if not sel:
             return None
         values = self.home_tree.item(sel[0])['values']
-        return (int(values[0]), values[1], values[3])
+        # values[2] — «Дата установки»: после удаления графы «Остаток срока»
+        # индексы сдвинулись, и прежний values[3] отдавал дату снятия.
+        return (int(values[0]), values[1], values[2])
 
     def _select_equipment_parts(self):
         """Показать запчасти выбранного оборудования в нижней панели."""
@@ -504,29 +526,25 @@ class GRPAppPG:
         install_txt = equip_install or "—"
         self.parts_card.config(text=f"🔩 Запчасти: {equip_name}  (срок от даты установки: {install_txt})")
 
+        has_replaceable = False
         for ep in parts:
             if ep[5]:  # снятая запись (история замены) — в составе не показываем
                 continue
             zam = "✓" if ep[7] else "—"
-            # Срок детали считается от даты её установки, а если она не задана —
+            has_replaceable = has_replaceable or bool(ep[7])
+            # Срок запчасти считается от даты её установки, а если она не задана —
             # от даты установки оборудования.
             inst_date = ep[4] or equip_install
-            rem = self._part_remaining_life(ep[4], equip_install, ep[3])
-            ost = years_to_text(rem) if rem is not None else "—"
             self.parts_tree.insert('', tk.END, values=(
-                ep[0], ep[2], ep[6] or "", zam, inst_date or "—", ost))
+                ep[0], ep[2], ep[6] or "", zam, inst_date or "—"))
 
-        remaining = self.doc_analyzer.get_remaining_life(equip_id, equip_install)
-        if remaining is not None:
-            state = ""
-            if remaining < 0:
-                state = f" — ⚠️ ПРОСРОЧЕНО на {years_to_text(-remaining)}"
-            elif remaining < 1:
-                state = f" — ⚠️ осталось {years_to_text(remaining)}"
-            self.parts_effective_label.config(
-                text=f"📆 Слабейшая заменяемая деталь: осталось {years_to_text(remaining)}{state}")
-        else:
-            self.parts_effective_label.config(text="💡 Заменяемых деталей нет")
+        # Сколько осталось, здесь не пишем: срок задают только заменяемые
+        # запчасти (норма 5 лет), и отсчитывается он от даты их установки.
+        self.parts_effective_label.config(
+            text=("📆 Срок оборудования задают заменяемые запчасти (норма 5 лет) — "
+                  "от даты установки запчасти, а без неё от даты установки оборудования."
+                  if has_replaceable else
+                  "💡 Заменяемых запчастей нет — собственного срока у оборудования нет"))
 
     def _selected_part_row(self):
         """Строка выбранной запчасти из нижней панели: (ep_id, name) или None."""
@@ -816,22 +834,18 @@ class GRPAppPG:
         equipment = self.db.get_equipment_by_grp(grp[0])
         repl_count = self.db.count_replacements_by_grp(grp[0])
 
+        passport = grp_passport.values(grp)
         self.info_name_label.config(text=grp[1], fg="#37474F")
         self.info_label.config(text=(
             f"Линий: {grp[2]}   |   Фактический срок: {years_to_text(grp[3])}   |   Проектный срок: {years_to_text(grp[4])}   |   "
-            f"Оборудование: {len(equipment)} шт.   |   Замены (ремонт): {repl_count}"
+            f"Оборудование: {len(equipment)} шт.   |   Замены (ремонт): {repl_count}\n"
+            f"Адрес: {passport.get('address') or '—'}   |   "
+            f"Рег. №: {passport.get('reg_number') or '—'}"
         ))
 
         for e in equipment:
             status = e[3] if e[3] else "в эксплуатации"
-            remaining = self.doc_analyzer.get_remaining_life(e[0], e[2])
-            if remaining is None:
-                lifespan = "⛔ внесите оборудование"
-            elif remaining < 0:
-                lifespan = f"⚠️ просрочено на {years_to_text(-remaining)}"
-            else:
-                lifespan = f"{years_to_text(remaining)}"
-            self.home_tree.insert('', tk.END, values=(e[0], e[1], lifespan, e[2], status))
+            self.home_tree.insert('', tk.END, values=(e[0], e[1], e[2] or "—", status))
 
         self.parts_card.config(text="🔩 Запчасти выбранного оборудования")
         self.parts_effective_label.config(text="")
@@ -906,10 +920,12 @@ class GRPAppPG:
 
         cpf = tk.Frame(self.catalog_parts_card)
         cpf.pack(fill=tk.BOTH, expand=True)
-        cat_cols = ("ID", "Запчасть", "Обозначение", "Замен.", "Дата установки / замены", "Остаток")
+        # У модели каталога остатка быть не может: отсчёт идёт от даты
+        # установки в ГРП, а её у каталожной позиции нет — поэтому и графы нет.
+        cat_cols = ("ID", "Запчасть", "Обозначение", "Замен.", "Дата установки / замены")
         self.catalog_parts_tree = ttk.Treeview(cpf, columns=cat_cols, show="headings", height=6)
         cat_w = {"ID": 40, "Запчасть": 280, "Обозначение": 200, "Замен.": 55,
-                 "Дата установки / замены": 160, "Остаток": 120}
+                 "Дата установки / замены": 160}
         for c in cat_cols:
             self.catalog_parts_tree.heading(c, text=c)
             self.catalog_parts_tree.column(c, width=cat_w.get(c, 100))
@@ -1089,13 +1105,10 @@ class GRPAppPG:
                 continue
             zam = "✓" if ep[7] else "—"
             inst_date = ep[4]
-            # Модель каталога — шаблон без даты установки, поэтому отсчёт
-            # срока детали здесь невозможен (в ГРП он идёт от даты
-            # установки оборудования).
-            rem = self._part_remaining_life(ep[4], None, ep[3])
-            ost = years_to_text(rem) if rem is not None else "—"
+            # Модель каталога — шаблон без даты установки, поэтому остатка
+            # здесь не бывает (в ГРП он идёт от даты установки оборудования).
             self.catalog_parts_tree.insert('', tk.END, values=(
-                ep[0], ep[2], ep[6] or "", zam, inst_date or "—", ost))
+                ep[0], ep[2], ep[6] or "", zam, inst_date or "—"))
         if parts:
             self.catalog_parts_effective.config(
                 text=f"📋 Запчастей: {len(parts)} · норма: заменяемые — 5 лет, "
@@ -1234,7 +1247,7 @@ class GRPAppPG:
         tk.Label(self.repairs_tab,
                  text="💡 Замены хранятся в БД и автоматически записываются в файл «Замены.xlsx»\n"
                       "(один лист «Ремонт …» на каждый ГРП, формат как в «Лида.xlsx»).\n"
-                      "⚙️ Если в записи выбрано «сбросить срок детали» или «заменить оборудование "
+                      "⚙️ Если в записи выбрано «сбросить срок запчасти» или «заменить оборудование "
                       "целиком», срок службы пересчитывается заново от даты замены.",
                  fg="#6c757d", font=("Arial", 9), justify=tk.CENTER).pack(pady=5)
 
@@ -1276,7 +1289,7 @@ class GRPAppPG:
         """Человекочитаемая подпись влияния записи журнала на срок службы."""
         if effect == 'part':
             where = ' → '.join(x for x in (eq_name, part_name) if x)
-            return f'срок заново: {where}' if where else 'срок детали заново'
+            return f'срок заново: {where}' if where else 'срок запчасти заново'
         if effect == 'equipment':
             return f'срок заново: {eq_name} (целиком)' if eq_name else 'срок оборудования заново'
         return '—'
@@ -1346,13 +1359,13 @@ class GRPAppPG:
 
         eq_combo = ttk.Combobox(effect_frame, width=32, values=eq_names, state="readonly")
         part_combo = ttk.Combobox(effect_frame, width=32, state="readonly")
-        part_choice = {}          # подпись детали → (part_id, part_number, is_replaceable, norm)
+        part_choice = {}          # подпись запчасти → (part_id, part_number, is_replaceable, norm)
         eff_var = tk.StringVar(value='')
 
         tk.Label(effect_frame, text="Оборудование:", font=("Arial", 9)).grid(
             row=0, column=0, sticky=tk.E, padx=(0, 4), pady=3)
         eq_combo.grid(row=0, column=1, sticky=tk.W, pady=3)
-        tk.Label(effect_frame, text="Деталь:", font=("Arial", 9)).grid(
+        tk.Label(effect_frame, text="Запчасть:", font=("Arial", 9)).grid(
             row=1, column=0, sticky=tk.E, padx=(0, 4), pady=3)
         part_combo.grid(row=1, column=1, sticky=tk.W, pady=3)
         tk.Label(effect_frame, text="Что сделать со сроком:",
@@ -1362,7 +1375,7 @@ class GRPAppPG:
         effects.grid(row=2, column=1, sticky=tk.W, pady=3)
         eff_none = tk.Radiobutton(effects, text="только журнал",
                                   variable=eff_var, value='', font=("Arial", 9))
-        eff_part = tk.Radiobutton(effects, text="сбросить срок детали",
+        eff_part = tk.Radiobutton(effects, text="сбросить срок запчасти",
                                   variable=eff_var, value='part', font=("Arial", 9))
         eff_eq = tk.Radiobutton(effects, text="заменить оборудование целиком",
                                 variable=eff_var, value='equipment', font=("Arial", 9))
@@ -1382,11 +1395,11 @@ class GRPAppPG:
                 part_name = part_combo.get()
                 choice = part_choice.get(part_name)
                 if not choice:
-                    effect_hint.config(text="⚠️ Выберите деталь — без неё сбросить срок нечего.")
+                    effect_hint.config(text="⚠️ Выберите запчасть — без неё сбросить срок нечего.")
                 elif not choice[2]:
                     effect_hint.config(
                         text=f"⚠️ «{part_name}» не заменяемая: сброс срока возможен, "
-                             "но деталь не относится к расходным.")
+                             "но запчасть не относится к расходным.")
                 else:
                     effect_hint.config(
                         text=f"✅ Срок «{part_name}» ({years_to_text(choice[3])}) "
@@ -1403,10 +1416,10 @@ class GRPAppPG:
                     n = len([p for p in self.db.get_equipment_parts_full(eq[0]) if not p[5]])
                     effect_hint.config(
                         text=f"✅ Оборудование «{eq[1]}» будет снято {date_entry.get().strip() or '—'}, "
-                             f"создано новое, сроки всех {n} деталей — заново.")
+                             f"создано новое, сроки всех {n} запчастей — заново.")
 
         def active_parts(eq):
-            """Активные детали оборудования: подпись → (part_id, номер, заменяемая, норма)."""
+            """Активные запчасти оборудования: подпись → (part_id, номер, заменяемая, норма)."""
             found = {}
             if not eq:
                 return found
@@ -1452,7 +1465,7 @@ class GRPAppPG:
                     eq_combo.set(eq[1])
                     on_eq_change()
             if part_id and not eq_id:
-                # привязка только к детали: ищем оборудование, где она установлена
+                # привязка только к запчасти: ищем оборудование, где она установлена
                 for cand in equipment:
                     if any(c[0] == part_id for c in active_parts(cand).values()):
                         eq_combo.set(cand[1])
@@ -1474,8 +1487,8 @@ class GRPAppPG:
                 if not choice:
                     messagebox.showerror(
                         "Ошибка",
-                        "Выбран режим «сбросить срок детали», но деталь не указана.\n\n"
-                        "Выберите деталь в списке или переключите режим на «только журнал».")
+                        "Выбран режим «сбросить срок запчасти», но запчасть не указана.\n\n"
+                        "Выберите запчасть в списке или переключите режим на «только журнал».")
                     return
                 part_id, part_number, _is_repl, _norm = choice
                 part_entry.delete(0, tk.END)
@@ -1529,10 +1542,10 @@ class GRPAppPG:
                 if not messagebox.askyesno(
                         "Подтверждение замены оборудования",
                         f"Оборудование «{eq[1]}» будет полностью заменено {date_text}.\n\n"
-                        f"Оно и все его детали ({len(active)} шт.) будут сняты с "
+                        f"Оно и все его запчасти ({len(active)} шт.) будут сняты с "
                         f"эксплуатации {date_text}, будет создано новое оборудование, "
-                        f"и срок службы каждой детали начнётся заново.\n\n"
-                        f"Прежняя история деталей сохранится. Продолжить?"):
+                        f"и срок службы каждой запчасти начнётся заново.\n\n"
+                        f"Прежняя история запчастей сохранится. Продолжить?"):
                     return
             new_eq_id = None
             try:
@@ -1566,7 +1579,7 @@ class GRPAppPG:
                 self.sync_excel(silent=True)
                 notes = {
                     '': "срок не изменён",
-                    'part': f"срок детали отсчитывается заново с {date_text}",
+                    'part': f"срок запчасти отсчитывается заново с {date_text}",
                     'equipment': f"оборудование заменено {date_text}, сроки заново",
                 }
                 extra = f" ({reverted})" if reverted else ""
@@ -1589,7 +1602,7 @@ class GRPAppPG:
         self._replacement_dialog(grp[0], grp[1])
 
     def replace_part(self):
-        """Замена запчасти: дата + физ. замена детали в составе оборудования
+        """Замена запчасти: дата + физ. замена запчасти в составе оборудования
         и строка в журнале замен (Excel в формате М.ГГГГ)."""
         grp = self._current_grp()
         if grp is None:
@@ -1667,10 +1680,10 @@ class GRPAppPG:
                               font=("Arial", 10, "bold"), padx=6, pady=4)
         right.grid(row=0, column=1, sticky="nsew")
 
-        cols = ("ID", "Запчасть", "Обозначение", "Замен.", "Остаток", "Норма")
+        cols = ("ID", "Запчасть", "Обозначение", "Замен.", "Норма")
         parts_tree = ttk.Treeview(right, columns=cols, show="headings", height=12)
         widths = {"ID": 40, "Запчасть": 200, "Обозначение": 110, "Замен.": 55,
-                  "Остаток": 115, "Норма": 90}
+                  "Норма": 90}
         for c in cols:
             parts_tree.heading(c, text=c)
             parts_tree.column(c, width=widths[c], anchor=tk.W)
@@ -1714,10 +1727,8 @@ class GRPAppPG:
                     continue
                 ep_id, part_id, name, norm, p_install, _removal, pnum, is_repl = ep
                 parts[ep_id] = (eq, part_id, name, norm, pnum or "", is_repl)
-                rem = self._part_remaining_life(p_install, eq[2], norm)
                 parts_tree.insert('', tk.END, values=(
                     ep_id, name, pnum or "", "✓" if is_repl else "—",
-                    years_to_text(rem) if rem is not None else "—",
                     years_to_text(norm)))
 
         def on_equipment_select(_event=None):
@@ -1735,7 +1746,7 @@ class GRPAppPG:
             ep_id = int(parts_tree.item(sel[0])['values'][0])
             eq, _pid, _name, _norm, pnumber, is_repl = parts[ep_id]
             sel_info.config(text=f"Выбрано: {_name}  ·  обозначение: {pnumber or '—'}  ·  оборудование: {eq[1]}")
-            self.statusbar.config(text=f"Деталь «{_name}» — {'заменяемая ✓' if is_repl else 'НЕ заменяемая'}")
+            self.statusbar.config(text=f"Запчасть «{_name}» — {'заменяемая ✓' if is_repl else 'НЕ заменяемая'}")
 
         eq_tree.bind('<<TreeviewSelect>>', on_equipment_select)
         parts_tree.bind('<<TreeviewSelect>>', on_part_select)
@@ -1756,8 +1767,8 @@ class GRPAppPG:
             if not is_repl:
                 messagebox.showerror(
                     "Ошибка",
-                    f"Деталь «{name}» НЕ заменяемая.\n\n"
-                    "Заменять можно только детали, отмеченные «✓» "
+                    f"Запчасть «{name}» НЕ заменяемая.\n\n"
+                    "Заменять можно только запчасти, отмеченные «✓» "
                     "(в «Запчастях оборудования» кнопка «🔄 Заменяемая»).")
                 return
             num = pnumber
@@ -1787,14 +1798,14 @@ class GRPAppPG:
                 self.sync_excel(silent=True)
                 self.statusbar.config(text=f"Замена «{name}» от {date_input} — новый срок {years_to_text(norm)}")
                 messagebox.showinfo("✅ Замена выполнена",
-                                    f"Деталь «{name}» заменена на такую же новую.\n\n"
+                                    f"Запчасть «{name}» заменена на такую же новую.\n\n"
                                     f"Дата установки (замены): {date_input}\n"
                                     f"Новый срок службы: {years_to_text(norm)} — снова с этой даты.")
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
 
         def replace_whole_equipment():
-            """Полная замена оборудования: сроки всех его деталей — заново."""
+            """Полная замена оборудования: сроки всех его запчастей — заново."""
             sel = eq_tree.selection()
             if not sel:
                 messagebox.showwarning("Внимание", "Сначала выберите оборудование!")
@@ -1812,17 +1823,17 @@ class GRPAppPG:
                       if not p[5]]
             norm_list = '\n'.join(
                 f'  • {p[2]} — {years_to_text(p[3])} (срок заново с {date_input})'
-                for p in active) or '  • состав деталей не заполнен'
+                for p in active) or '  • состав запчастей не заполнен'
 
             if not messagebox.askyesno(
                     "Подтверждение полной замены",
                     f"Оборудование «{eq[1]}» будет полностью заменено "
                     f"{date_input}.\n\n"
-                    f"Прежнее оборудование и все его детали будут сняты "
+                    f"Прежнее оборудование и все его запчасти будут сняты "
                     f"с эксплуатации этой датой. Будет создано новое "
                     f"оборудование с датой установки {date_input}, и срок службы "
-                    f"каждой детали начнётся заново:\n\n{norm_list}\n\n"
-                    f"Прежняя история деталей сохранится. Продолжить?"):
+                    f"каждой запчасти начнётся заново:\n\n{norm_list}\n\n"
+                    f"Прежняя история запчастей сохранится. Продолжить?"):
                 return
 
             try:
@@ -1841,14 +1852,14 @@ class GRPAppPG:
                 self.sync_excel(silent=True)
                 self.statusbar.config(
                     text=f"Оборудование «{eq[1]}» полностью заменено "
-                         f"{date_input} — сроки деталей с новой даты")
+                         f"{date_input} — сроки запчастей с новой даты")
                 messagebox.showinfo(
                     "✅ Оборудование заменено",
                     f"«{eq[1]}» полностью заменено {date_input}.\n\n"
-                    f"Прежнее оборудование и его детали сняты с эксплуатации.\n"
+                    f"Прежнее оборудование и его запчасти сняты с эксплуатации.\n"
                     f"Создано новое оборудование (ID {new_id}) с датой установки "
                     f"{date_input}.\n\n"
-                    f"Срок службы всех {len(active)} деталей отсчитывается заново "
+                    f"Срок службы всех {len(active)} запчастей отсчитывается заново "
                     f"от этой даты.")
                 window.destroy()
             except Exception as e:
@@ -1856,7 +1867,7 @@ class GRPAppPG:
 
         btn_frame = tk.Frame(window)
         btn_frame.pack(pady=8)
-        self._btn(btn_frame, "💾 Заменить деталь", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=8)
+        self._btn(btn_frame, "💾 Заменить запчасть", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=8)
         self._btn(btn_frame, "🔄 Заменить оборудование полностью",
                   replace_whole_equipment, color='primary', font_size=10,
                   padx=20).pack(side=tk.LEFT, padx=8)
@@ -2000,8 +2011,13 @@ class GRPAppPG:
         design_entry.grid(row=3, column=1, pady=5)
 
         tk.Label(frame, text="срок можно ввести как «7 лет 4 мес», «7,3» или просто «7,3 года»",
-                 font=("Arial", 8), fg="#6c757d").grid(row=4, column=0, columnspan=2,
+                 font=("Arial", 8), fg="#6c757d").grid(row=4, column=0, columnspan=4,
                                                          sticky=tk.W, pady=(0, 4))
+
+        tk.Label(frame, text="Сведения о ГРП (паспорт объекта)",
+                 font=("Arial", 11, "bold"), fg="#546E7A").grid(
+            row=5, column=0, columnspan=4, sticky=tk.W, pady=(12, 2))
+        passport_widgets = _grp_passport_form(frame, start_row=6)
 
         def save():
             try:
@@ -2017,7 +2033,9 @@ class GRPAppPG:
                 actual = parse_years_strict(actual_entry.get(), "фактический срок")
                 design = parse_years_strict(design_entry.get(), "проектный срок")
 
-                new_id = self.db.add_grp(grp_type, lines, actual, design)
+                new_id = self.db.add_grp(
+                    grp_type, lines, actual, design,
+                    passport=_grp_passport_values(passport_widgets))
                 window.destroy()
                 self.set_current_grp(new_id)
                 self.statusbar.config(text=f"Добавлен ГРП: {grp_type}")
@@ -2035,7 +2053,7 @@ class GRPAppPG:
         btn_frame.pack(pady=20)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
-        fit_window(window, min_width=560, min_height=380)
+        fit_window(window, min_width=880, min_height=620)
 
     def edit_grp(self):
         """Редактирование выбранного ГРП"""
@@ -2045,6 +2063,9 @@ class GRPAppPG:
         grp_id = grp[0]
 
         grp_data = self.db.get_grp_by_id(grp_id)
+        if not grp_data:
+            messagebox.showerror("Ошибка", f"ГРП #{grp_id} не найден в базе")
+            return
 
         window = Toplevel(self.root)
         window.title(f"Редактирование ГРП ID={grp_id}")
@@ -2078,8 +2099,14 @@ class GRPAppPG:
         design_entry.grid(row=3, column=1, pady=5)
 
         tk.Label(frame, text="срок можно ввести как «7 лет 4 мес», «7,3» или просто «7,3 года»",
-                 font=("Arial", 8), fg="#6c757d").grid(row=4, column=0, columnspan=2,
+                 font=("Arial", 8), fg="#6c757d").grid(row=4, column=0, columnspan=4,
                                                          sticky=tk.W, pady=(0, 4))
+
+        tk.Label(frame, text="Сведения о ГРП (паспорт объекта)",
+                 font=("Arial", 11, "bold"), fg="#546E7A").grid(
+            row=5, column=0, columnspan=4, sticky=tk.W, pady=(12, 2))
+        passport_widgets = _grp_passport_form(
+            frame, start_row=6, values=grp_passport.values(grp_data))
 
         def save():
             try:
@@ -2095,7 +2122,9 @@ class GRPAppPG:
                 actual = parse_years_strict(actual_entry.get(), "фактический срок")
                 design = parse_years_strict(design_entry.get(), "проектный срок")
 
-                self.db.update_grp(grp_id, grp_type, lines, actual, design)
+                self.db.update_grp(
+                    grp_id, grp_type, lines, actual, design,
+                    passport=_grp_passport_values(passport_widgets))
                 messagebox.showinfo("Успех", "✅ ГРП обновлён!")
                 window.destroy()
                 self.set_current_grp(grp_id)
@@ -2109,7 +2138,7 @@ class GRPAppPG:
         btn_frame.pack(pady=20)
         self._btn(btn_frame, "💾 Сохранить", save, color='success', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
         self._btn(btn_frame, "❌ Отмена", window.destroy, color='danger', font_size=10, padx=20).pack(side=tk.LEFT, padx=10)
-        fit_window(window, min_width=560, min_height=420)
+        fit_window(window, min_width=880, min_height=660)
 
     def delete_grp(self):
         """Удаление выбранного ГРП (вместе с оборудованием и историей)"""
@@ -2218,11 +2247,6 @@ class GRPAppPG:
         grp_id = grp[0]
         grp_name = grp[1]
 
-        equipment_data = self.db.get_equipment_by_grp(grp_id)
-        if not equipment_data:
-            messagebox.showinfo("Информация", "У данного ГРП нет оборудования для отчёта")
-            return
-
         filename = filedialog.asksaveasfilename(
             defaultextension=".docx",
             filetypes=[("Word документы", "*.docx")],
@@ -2233,8 +2257,7 @@ class GRPAppPG:
 
         try:
             saved = word_report_pg.generate_grp_docx(
-                self.db, self.doc_analyzer, grp_id, grp_name, filename,
-                params=self.calc_params)
+                self.db, grp_id, grp_name, filename, params=self.calc_params)
             messagebox.showinfo("Успех", f"Отчёт по ГРП «{grp_name}» сохранён:\n{saved}")
             self.statusbar.config(text=f"Word-отчёт по ГРП {grp_name} сохранён")
         except Exception as e:

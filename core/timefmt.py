@@ -3,6 +3,9 @@
 Правило проекта: срок НИКОГДА не пишется десятичной дробью («7,30 лет»).
 Длительность показывается словами: «7 лет 4 мес», «3 мес 2 нед», «5 дн».
 В том же виде срок принимается обратно в поля ввода (см. parse_years).
+
+Здесь же — название месяца для дат: в отчётности дату указывают месяцем
+(«январь 2027»), а не числом.
 """
 
 import re
@@ -11,6 +14,10 @@ from typing import Optional
 MONTHS_IN_YEAR = 12.0
 DAYS_IN_MONTH = 30.44
 DAYS_IN_WEEK = 7.0
+
+# Названия месяцев в именительном падеже: по номеру месяца 1…12.
+MONTH_NAMES_RU = ('январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
+                  'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь')
 
 # Слова месяцев в любом написании (год/года/лет, месяц/мес, неделя/нед, день/дн).
 _UNIT_ALIASES = {
@@ -108,12 +115,16 @@ def years_to_text(years: Optional[float], months_abbr: str = "мес",
     return sign + " ".join(parts)
 
 
-def years_to_text_or_dash(years: Optional[float]) -> str:
-    """years_to_text с прочерком вместо нуля (для ячеек отчёта и таблиц)."""
-    value = _to_float(years)
-    if value is None:
-        return "—"
-    return years_to_text(value)
+def month_year_text(day) -> str:
+    """Дата → «январь 2027»; None → «—».
+
+    Месяц и год, без числа: так указывают срок следующего диагностирования.
+    Функция нарочно не разбирает строки — на вход идёт уже готовая дата
+    (например, из core.lifetimes.expiry_date).
+    """
+    if day is None:
+        return '—'
+    return f'{MONTH_NAMES_RU[day.month - 1]} {day.year}'
 
 
 def _normalize_unit(raw: str) -> Optional[str]:
