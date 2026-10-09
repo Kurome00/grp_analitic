@@ -25,12 +25,14 @@
     Каталог оборудования при пересоздании демо-данных не удаляется.
 """
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 from typing import List, Tuple
 
 import psycopg2
 
+from core import equipment_card
 from core.config import DB_CONFIG
 from core.lifetimes import DAYS_IN_YEAR, years_between
 
@@ -405,6 +407,79 @@ def _actual_life(install: str, today=None) -> float:
     return 0.0 if value is None else round(value, 2)
 
 
+# Изготовители моделей демо-каталога: заводское обозначение модели начинается
+# с этого обозначения серии. Порядок важен — «РДГПК» проверяется раньше «РДГД».
+DEMO_MAKERS = (
+    ('КРОН', 'ООО «Газпроммаш»'),
+    ('РДГПК', 'АО «Газмаш»'),
+    ('РДГД', 'АО «Газмаш»'),
+    ('РДК', 'ООО «Газпроммаш»'),
+    ('РДС', 'ООО «Газпроммаш»'),
+    ('ПЗКП', 'ООО «Газпроммаш»'),
+    ('ПКН', 'АО «Газмаш»'),
+    ('ПСК', 'АО «Газмаш»'),
+    ('РГП', 'АО «Газмаш»'),
+    ('РГК', 'АО «Газмаш»'),
+)
+
+# Назначенный срок службы и наработки демо-единиц: правдоподобные числа для
+# наглядности. Это демонстрационные данные, а не паспорт реального изделия.
+DEMO_ASSIGNED_LIFE = '20'
+DEMO_ASSIGNED_HOURS = '100000'
+DEMO_HOURS_PER_YEAR = 6000
+DEMO_NOTE = 'слабое звено расчёта — расходные запчасти выработали ресурс'
+
+
+def _demo_card(name: str, install: str, position: int, count: int) -> dict:
+    """Паспортные сведения демо-единицы: разбираются из названия модели.
+
+    В демо-сценариях названия единиц — заводские обозначения из каталога
+    («… КРОН-150»), поэтому тип (модель), изготовитель и условный проход
+    выводятся из названия, а не перечисляются руками у каждой единицы.
+    Фактическая наработка считается по сроку эксплуатации.
+    """
+    # Обозначение модели — последнее слово названия, и только если оно похоже
+    # на заводское обозначение (есть заглавные буквы). Иначе его нет: у
+    # «Регулятора пилотного» последнее слово — часть описания, а не модель.
+    token = name.split()[-1]
+    model = token if token != token.lower() else ''
+    maker = next((maker for series, maker in DEMO_MAKERS
+                  if model.upper().startswith(series)), '')
+    dn = re.search(r'-(\d+)', model)
+    hours = int(_actual_life(install) * DEMO_HOURS_PER_YEAR)
+    return {
+        'model': model,
+        'manufacturer': maker,
+        'dn': dn.group(1) if dn else '',
+        'quantity': '1',
+        'scheme_number': str(position),
+        'assigned_life': DEMO_ASSIGNED_LIFE,
+        'assigned_hours': DEMO_ASSIGNED_HOURS,
+        'actual_hours': str(hours),
+        'note': DEMO_NOTE if position == count else '',
+    }
+
+
+def _fill_demo_cards(db, units, listed, install: str) -> int:
+    """Дополнить паспорта уже созданных демо-единиц. Возвращает число правок.
+
+    Сценарии, созданные прежней версией, новых граф не знают, и в таблице
+    оборудования у них прочерки. Заполняются только полностью пустые
+    паспорта: то, что пользователь ввёл руками, остаётся нетронутым.
+    """
+    names = [item["name"] for item in listed]
+    filled = 0
+    for row in units:
+        if any(equipment_card.values(row).values()):
+            continue
+        if row[1] not in names:
+            continue
+        card = _demo_card(row[1], install, names.index(row[1]) + 1, len(names))
+        db.update_equipment(row[0], row[1], row[2], row[3], details=card)
+        filled += 1
+    return filled
+
+
 def _is_demo_scenario(grp_type: str) -> bool:
     """Демо-сценарий — это ГРП, чей тип начинается с префикса сценариев.
 
@@ -489,11 +564,14 @@ def seed_examples(reset: bool = False):
         existing_id = existing.get(grp_type)
 
         if existing_id is not None:
-            # Сценарий уже создан — не трогаем его содержимое.
-            units = len(db.get_equipment_by_grp(existing_id))
-            if units == len(ex["equipment"]):
+            # Сценарий уже создан — не трогаем его содержимое, но дополняем
+            # пустые паспорта: сценарии прежних версий новых граф не знают.
+            units = db.get_equipment_by_grp(existing_id)
+            if len(units) == len(ex["equipment"]):
+                filled = _fill_demo_cards(db, units, ex["equipment"], install)
+                note = f", паспортов заполнено: {filled}" if filled else ""
                 print(f"[=] Сценарий уже есть, пропуск: «{grp_type}» "
-                      f"(ID={existing_id}, единиц: {units})")
+                      f"(ID={existing_id}, единиц: {len(units)}{note})")
                 kept += 1
                 continue
             # ГРП есть, но неполный (например, создание оборвалось после сбоя) —
@@ -505,9 +583,12 @@ def seed_examples(reset: bool = False):
         grp_id = db.add_grp(grp_type, ex["lines_count"],
                             _actual_life(install), ex["design_life"])
         equipment_ids = []
-        for item in ex["equipment"]:
+        units = ex["equipment"]
+        for position, item in enumerate(units, start=1):
             name = item["name"]
-            eq_id = db.add_equipment(grp_id, name, install, None)
+            card = _demo_card(name, install, position, len(units))
+            eq_id = db.add_equipment(grp_id, name, install, None,
+                                     details=card)
             if not _link_full_parts(db, templates, eq_id, name):
                 print(f"    ⚠️ {name} — модели нет в каталоге, запчасти не привязаны")
             equipment_ids.append(eq_id)

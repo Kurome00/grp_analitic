@@ -58,6 +58,35 @@ def _sanitize(value) -> str:
     return value.replace('\n', ' ').strip()
 
 
+def _norm(name: str) -> str:
+    """Нормализация названия для сопоставления."""
+    return re.sub(r'\s+', ' ', name or '').replace('ё', 'е').strip().lower()
+
+
+def _designation(title: str) -> str:
+    """Обозначение единицы альбома — последнее слово названия («РДС-32»)."""
+    words = _norm(title).split()
+    return words[-1] if words else ''
+
+
+def is_breakdown_page(title: str, titles) -> bool:
+    """Страница разборки узла, а не самостоятельное оборудование.
+
+    В альбоме после модели идут страницы её узлов: за «Регулятором давления
+    газа РДС-32» — «Корпус регулятора давления газа РДС-32» и «Мембрана
+    регулятора давления газа РДС-32». Это запчасти модели: обозначение у них
+    то же, а название длиннее. Отдельный узел со своим названием («Механизм
+    настройки ПЗК») под правило не попадает — его обозначения нет ни у одной
+    другой единицы, и оборудованием он быть не перестаёт.
+    """
+    own = _norm(title)
+    key = _designation(title)
+    if not own or not key:
+        return False
+    return any(_designation(other) == key and len(_norm(other)) < len(own)
+               for other in titles)
+
+
 def _clean_title(lines) -> str:
     """Собирает заголовок единицы оборудования до начала таблицы."""
     used = []
@@ -123,7 +152,13 @@ def scan_pdf(pdf_path: str):
 
 
 def create_catalog_equipment(db, units, grp_name: str) -> int:
-    """Создаёт ГРП-каталог и добавляет в него оборудование по полным названиям из альбома."""
+    """Создаёт ГРП-каталог и добавляет в него оборудование по названиям из альбома.
+
+    Единица альбома — это страница. Страницы разборки узлов («Корпус …»,
+    «Мембрана …») оборудованием не считаются: их запчасти и так входят в
+    состав модели (см. is_breakdown_page), и в каталоге они только мешали бы
+    оборудованию с запчастями.
+    """
     grp_id = None
     for g in db.get_all_grp():
         if g[1].lower() == grp_name.lower():
@@ -133,15 +168,25 @@ def create_catalog_equipment(db, units, grp_name: str) -> int:
         grp_id = db.add_grp(grp_name, 1, 0.0, 0.0)
         print(f"[+] Создан ГРП: '{grp_name}'")
 
+    titles = [u['unit'] for u in units if u['unit']]
     existing = {e[1].lower() for e in db.get_equipment_by_grp(grp_id)}
     created = 0
+    skipped = []
     for u in units:
         if not u['unit'] or u['unit'].lower() in existing:
+            continue
+        if is_breakdown_page(u['unit'], titles):
+            skipped.append(u['unit'])
             continue
         db.add_equipment(grp_id, u['unit'], None)
         existing.add(u['unit'].lower())
         created += 1
     print(f"[+] Оборудование добавлено в '{grp_name}': {created}")
+    if skipped:
+        print(f"    Пропущено страниц разборки узлов (это запчасти модели): "
+              f"{len(skipped)}")
+        for title in skipped:
+            print(f"    - '{title}'")
     return grp_id
 
 
@@ -229,11 +274,6 @@ REPLACEABLE_KEYWORDS = (
 
 # Исключения конструктивных деталей (не заменяемые), даже если слово попало выше
 NON_REPLACEABLE_EXACT = {'клапан предохранительный', 'клапан перепускной'}
-
-
-def _norm(name: str) -> str:
-    """Нормализация названия для сопоставления."""
-    return re.sub(r'\s+', ' ', name or '').replace('ё', 'е').strip().lower()
 
 
 def _name_matches(row_name: str, part_name: str) -> bool:

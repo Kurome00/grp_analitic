@@ -860,7 +860,13 @@ class GRPResourceCalculator:
             element.k_manual.append(name)
 
     def _calc_k_state(self, element: ElementResult, equip: Dict) -> None:
-        """K_сост = 1 − (1/n)·Σ |Δij| / Допускij."""
+        """K_сост = 1 − (1/n)·Σ |Δij| / Допускij.
+
+        Отклонение берётся от режима проверки, делится на полосу допуска
+        (допуск макс − допуск мин) — так же, как в расчётном файле паспорта.
+        Если одна из границ не задана, делителем служит расстояние от режима
+        до имеющейся границы.
+        """
         params = equip.get('state_params') or []
         rows = []
         for p in params:
@@ -871,7 +877,9 @@ class GRPResourceCalculator:
             tol_max = _f(p.get('tol_max'))
             tol_min = _f(p.get('tol_min'))
             tolerance = None
-            if nominal is not None and tol_max is not None:
+            if tol_min is not None and tol_max is not None:
+                tolerance = abs(tol_max - tol_min)
+            if tolerance is None and nominal is not None and tol_max is not None:
                 tolerance = abs(tol_max - nominal)
             if tolerance is None and nominal is not None and tol_min is not None:
                 tolerance = abs(nominal - tol_min)
@@ -1112,7 +1120,10 @@ class GRPResourceCalculator:
                                  f'    Z_база = {element.z_base_formula}'))
 
     def _step_coefficients(self, result: AlgorithmResult, element: ElementResult) -> None:
-        result.steps.append(Step('formula', '  Шаг 3. K_сост = 1 − (1/n)·Σ |Δij|/Допускij'))
+        result.steps.append(Step(
+            'formula',
+            '  Шаг 3. K_сост = 1 − (1/n)·Σ |Δij|/Допускij'
+            '   (Δ — от режима проверки, Допуск — полоса допуска)'))
         for row in element.k_state_detail:
             if row.get('skip'):
                 continue

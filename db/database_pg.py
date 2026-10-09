@@ -6,6 +6,11 @@ import psycopg2
 
 from core.config import DB_CONFIG, REPLACEABLE_NORM_YEARS, part_norm
 from core.grp_passport import BASE_COLUMNS, COLUMNS, PASSPORT_COLUMNS, ROW_COLUMNS
+from core.equipment_card import DETAIL_COLUMNS as CARD_COLUMNS
+from core.equipment_card import ROW_COLUMNS as EQUIPMENT_ROW_COLUMNS
+from core import diagnostic_log
+from core import failure_log
+from core import repair_journal
 
 
 class DatabasePG:
@@ -137,6 +142,16 @@ class DatabasePG:
             except Exception:
                 pass
 
+            # Паспортные сведения единицы оборудования (core.equipment_card).
+            # Добавляются колонками в конец: прежние поля сохраняют индексы,
+            # по которым их читают расчёт и интерфейс. Текстом — как раздел 1
+            # паспорта ГРП: числа переносятся так, как написаны в документации,
+            # и в расчёте не участвуют.
+            for column in CARD_COLUMNS:
+                cursor.execute(
+                    f"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS {column} "
+                    f"TEXT NOT NULL DEFAULT ''")
+
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_equipment_grp_id ON equipment(grp_id);
                 CREATE INDEX IF NOT EXISTS idx_equipment_name ON equipment(name);
@@ -238,12 +253,87 @@ class DatabasePG:
             # детали, 'equipment' — сброшены сроки всего оборудования.
             # Внешних ключей намеренно нет: журнал — исторический документ и
             # должен пережить удаление оборудования.
+            # hours_before / residual_after / document / note — графы
+            # ремонтного журнала (см. core.repair_journal): наработка до
+            # замены, остаточный ресурс после ремонта, документ-основание и
+            # примечание. Добавлены в конец, поэтому прежние поля записи
+            # сохранили свои индексы — по ним читают «Замены.xlsx», отчёт Word
+            # и расчёт методик.
             for column, dtype in (('equipment_id', 'INTEGER'),
                                   ('part_id', 'INTEGER'),
                                   ('new_equipment_id', 'INTEGER'),
-                                  ('effect', "VARCHAR(16) NOT NULL DEFAULT ''")):
+                                  ('effect', "VARCHAR(16) NOT NULL DEFAULT ''"),
+                                  ('hours_before', 'VARCHAR(64)'),
+                                  ('residual_after', 'VARCHAR(64)'),
+                                  ('document', 'VARCHAR(255)'),
+                                  ('note', 'TEXT')):
                 cursor.execute(
                     f'ALTER TABLE replacements ADD COLUMN IF NOT EXISTS {column} {dtype}')
+
+            # 8. Таблица отказов (информация по отказам).
+            # Графы записи — те же, что в таблице экрана (см. core.failure_log):
+            # дата выявления, тип события, причина, критичность, признак
+            # устранения, документ, куда отказ вносится, и примечания.
+            # Критичность и признак устранения NOT NULL DEFAULT '': пустая
+            # строка здесь значит «не указано», третье состояние (NULL) не
+            # нужно.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS failures (
+                    id SERIAL PRIMARY KEY,
+                    grp_id INTEGER NOT NULL REFERENCES grp(id) ON DELETE CASCADE,
+                    detected_date VARCHAR(255),
+                    event_type VARCHAR(255),
+                    reason TEXT,
+                    criticality VARCHAR(32) NOT NULL DEFAULT '',
+                    resolved VARCHAR(16) NOT NULL DEFAULT '',
+                    document VARCHAR(255),
+                    note TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # Фото (или скан акта) хранится в базе отдельной колонкой: к
+            # записи может быть приложен снимок, но список отказов читается
+            # без него — иначе таблица тянула бы из базы всё содержимое
+            # снимков.
+            cursor.execute('ALTER TABLE failures ADD COLUMN IF NOT EXISTS photo BYTEA')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_failures_grp_id ON failures(grp_id);
+            ''')
+
+            # 9. Таблица технического диагностирования (протокол проверок).
+            # Графы записи — те же, что в таблице экрана (см.
+            # core.diagnostic_log): дата, оборудование, проверяемый параметр,
+            # режим, допуск мин/макс, факт мин/макс, результат и примечание.
+            # Все значения в кПа хранятся текстом, как их перенесли из
+            # протокола: «1,3» и «1,30» — одно и то же число, но запись должна
+            # читаться так, как её вписал специалист.
+            # Результат NOT NULL DEFAULT '': пустая строка значит «не указан»,
+            # третье состояние (NULL) не нужно.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS diagnostic_checks (
+                    id SERIAL PRIMARY KEY,
+                    grp_id INTEGER NOT NULL REFERENCES grp(id) ON DELETE CASCADE,
+                    check_date VARCHAR(255),
+                    equipment VARCHAR(255),
+                    parameter VARCHAR(255),
+                    mode VARCHAR(64),
+                    tolerance_min VARCHAR(64),
+                    tolerance_max VARCHAR(64),
+                    fact_min VARCHAR(64),
+                    fact_max VARCHAR(64),
+                    result VARCHAR(32) NOT NULL DEFAULT '',
+                    note TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_diagnostic_checks_grp_id
+                    ON diagnostic_checks(grp_id);
+            ''')
 
             print("✅ База данных PostgreSQL инициализирована!")
 
@@ -323,37 +413,76 @@ class DatabasePG:
 
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ОБОРУДОВАНИЕМ ===
 
-    def add_equipment(self, grp_id: int, name: str, install_date: str, removal_date: str = None) -> int:
-        """Добавление оборудования"""
+    @staticmethod
+    def _card_values(details: Optional[Dict]) -> List[str]:
+        """Паспортные сведения для записи: чего не передали — пустая строка.
+
+        Пустая строка, а не NULL: у колонок NOT NULL DEFAULT '', и «не
+        заполнено» в паспорте изображается прочерком, а не третьим состоянием.
+        """
+        details = details or {}
+        return [str(details.get(column) or '') for column in CARD_COLUMNS]
+
+    def add_equipment(self, grp_id: int, name: str, install_date: str,
+                      removal_date: str = None,
+                      details: Optional[Dict] = None) -> int:
+        """Добавление оборудования.
+
+        details — паспортные сведения единицы (core.equipment_card.
+        DETAIL_COLUMNS): тип (модель), изготовитель, ДУ, количество, номер по
+        схеме, назначенный срок и наработки, примечание.
+        """
+        columns = ('grp_id', 'name', 'install_date', 'removal_date') + CARD_COLUMNS
+        placeholders = ', '.join(['%s'] * len(columns))
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO equipment (grp_id, name, install_date, removal_date)
-                VALUES (%s, %s, %s, %s)
+            cursor.execute(
+                f'''
+                INSERT INTO equipment ({', '.join(columns)})
+                VALUES ({placeholders})
                 RETURNING id
-            ''', (grp_id, name, install_date, removal_date))
+                ''',
+                (grp_id, name, install_date, removal_date)
+                + tuple(self._card_values(details)))
             return cursor.fetchone()[0]
 
     def get_equipment_by_grp(self, grp_id: int) -> List[Tuple]:
-        """Получение оборудования по ГРП (id, name, install_date, removal_date)"""
+        """Оборудование ГРП: id, name, install_date, removal_date и паспортные
+        сведения — порядок колонок задаёт core.equipment_card.ROW_COLUMNS."""
+        columns = ', '.join(
+            f'{column}::text' if column in ('install_date', 'removal_date')
+            else column
+            for column in EQUIPMENT_ROW_COLUMNS)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                SELECT id, name, install_date::text, removal_date::text
+            cursor.execute(
+                f'''
+                SELECT {columns}
                 FROM equipment WHERE grp_id = %s
                 ORDER BY install_date DESC
-            ''', (grp_id,))
+                ''', (grp_id,))
             return cursor.fetchall()
 
-    def update_equipment(self, equip_id: int, name: str, install_date: str, removal_date: str = None):
-        """Обновление оборудования"""
+    def update_equipment(self, equip_id: int, name: str, install_date: str,
+                         removal_date: str = None,
+                         details: Optional[Dict] = None):
+        """Обновление оборудования вместе с паспортными сведениями.
+
+        Сведения, которых нет в details, обнуляются — форма всегда присылает
+        полный набор полей, поэтому «очистил поле» значит «стёр значение».
+        """
+        assignments = ', '.join(f'{column} = %s' for column in CARD_COLUMNS)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            cursor.execute(
+                f'''
                 UPDATE equipment
-                SET name = %s, install_date = %s, removal_date = %s, updated_at = CURRENT_TIMESTAMP
+                SET name = %s, install_date = %s, removal_date = %s, {assignments},
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
-            ''', (name, install_date, removal_date, equip_id))
+                ''',
+                (name, install_date, removal_date)
+                + tuple(self._card_values(details)) + (equip_id,))
 
     def delete_equipment(self, equip_id: int):
         """Удаление оборудования"""
@@ -571,11 +700,18 @@ class DatabasePG:
                 'WHERE equipment_id = %s AND removal_date IS NULL',
                 (replace_date, equipment_id))
 
-            # Новое оборудование с новой датой установки
-            cursor.execute('''
-                INSERT INTO equipment (grp_id, name, install_date, removal_date)
-                VALUES (%s, %s, %s, NULL) RETURNING id
-            ''', (old_grp_id, new_name or old_name, replace_date))
+            # Новое оборудование с новой датой установки. Паспортные сведения
+            # переносятся от прежней единицы: меняется единица, а не её
+            # характеристики (тип, изготовитель, ДУ, назначенный срок).
+            card_columns = ', '.join(CARD_COLUMNS)
+            cursor.execute(
+                f'''
+                INSERT INTO equipment
+                    (grp_id, name, install_date, removal_date, {card_columns})
+                SELECT %s, %s, %s, NULL, {card_columns}
+                FROM equipment WHERE id = %s
+                RETURNING id
+                ''', (old_grp_id, new_name or old_name, replace_date, equipment_id))
             new_equipment_id = cursor.fetchone()[0]
 
             # Состав переносится с новой датой установки — сроки заново
@@ -705,7 +841,8 @@ class DatabasePG:
                         equipment_type: str, model: str, manufacturer: str,
                         work_type: str, reason: str, supervisor: str,
                         equipment_id: int = None, part_id: int = None,
-                        effect: str = '', new_equipment_id: int = None) -> int:
+                        effect: str = '', new_equipment_id: int = None,
+                        extras: Dict = None) -> int:
         """Добавление записи о замене запасной части.
 
         equipment_id / part_id / effect связывают запись с физическим объектом
@@ -713,18 +850,27 @@ class DatabasePG:
           effect=''         — только журнал, сроки не меняются;
           effect='part'     — срок детали отсчитывается заново с replace_date;
           effect='equipment' — срок всего оборудования (new_equipment_id).
+
+        extras — графы ремонтного журнала {ключ: значение} (см.
+        core.repair_journal): наработка до замены, остаточный ресурс после
+        ремонта, документ-основание, примечание.
         """
+        extras = extras or {}
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO replacements
                 (grp_id, replace_date, part_number, equipment_type, model, manufacturer,
-                 work_type, reason, supervisor, equipment_id, part_id, effect, new_equipment_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 work_type, reason, supervisor, equipment_id, part_id, effect,
+                 new_equipment_id, hours_before, residual_after, document, note)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s)
                 RETURNING id
             ''', (grp_id, replace_date, part_number, equipment_type, model, manufacturer,
                   work_type, reason, supervisor, equipment_id, part_id,
-                  effect or '', new_equipment_id))
+                  effect or '', new_equipment_id,
+                  extras.get('hours_before'), extras.get('residual_after'),
+                  extras.get('document'), extras.get('note')))
             return cursor.fetchone()[0]
 
     def update_replacement(self, repl_id: int, replace_date: str, part_number: str,
@@ -732,13 +878,16 @@ class DatabasePG:
                            work_type: str, reason: str, supervisor: str,
                            equipment_id: int = None, part_id: int = None,
                            effect: str = None, new_equipment_id: int = None,
-                           clear_links: bool = False):
+                           clear_links: bool = False, extras: Dict = None):
         """Обновление записи о замене запасной части.
 
         effect=None — оставить прежнюю привязку к оборудованию/детали;
         effect='' — привязка остаётся, но запись на сроки не влияет.
         clear_links=True — привязку снести (NULL), в том числе effect.
+        extras — графы ремонтного журнала (см. add_replacement); записываются
+        как показаны в форме, поэтому пустое значение стирает прежнее.
         """
+        extras = extras or {}
         if clear_links:
             equipment_id = part_id = new_equipment_id = None
             effect = effect or ''
@@ -752,11 +901,14 @@ class DatabasePG:
                     part_id = COALESCE(%s, part_id),
                     effect = COALESCE(%s, effect),
                     new_equipment_id = COALESCE(%s, new_equipment_id),
+                    hours_before = %s, residual_after = %s, document = %s, note = %s,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
             ''', (replace_date, part_number, equipment_type, model, manufacturer,
                   work_type, reason, supervisor, equipment_id, part_id, effect,
-                  new_equipment_id, repl_id))
+                  new_equipment_id, extras.get('hours_before'),
+                  extras.get('residual_after'), extras.get('document'),
+                  extras.get('note'), repl_id))
             if clear_links:
                 cursor.execute('''
                     UPDATE replacements
@@ -772,13 +924,19 @@ class DatabasePG:
             cursor.execute('DELETE FROM replacements WHERE id = %s', (repl_id,))
 
     def get_replacement(self, repl_id: int) -> Optional[Tuple]:
-        """Одна запись журнала: 9 полей записи + equipment_id, part_id, effect, new_equipment_id."""
+        """Одна запись журнала.
+
+        Порядок полей — core.repair_journal.RECORD_COLUMNS: девять прежних
+        полей, привязка (equipment_id, part_id, effect, new_equipment_id) и
+        графы ремонтного журнала.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, replace_date, part_number, equipment_type, model,
                        manufacturer, work_type, reason, supervisor,
-                       equipment_id, part_id, effect, new_equipment_id
+                       equipment_id, part_id, effect, new_equipment_id,
+                       hours_before, residual_after, document, note
                 FROM replacements WHERE id = %s
             ''', (repl_id,))
             return cursor.fetchone()
@@ -786,14 +944,16 @@ class DatabasePG:
     def get_replacements_by_grp(self, grp_id: int) -> List[Tuple]:
         """Замены по ГРП.
 
-        Кортежи: (id, replace_date, part_number, equipment_type, model,
-        manufacturer, work_type, reason, supervisor)
+        Порядок полей — core.repair_journal.BY_GRP_COLUMNS: восемь прежних
+        полей («Замены.xlsx», отчёт Word, расчёт методик читают их по
+        индексам) и графы ремонтного журнала в конце.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, replace_date, part_number, equipment_type, model,
-                       manufacturer, work_type, reason, supervisor
+                       manufacturer, work_type, reason, supervisor,
+                       hours_before, residual_after, document, note
                 FROM replacements
                 WHERE grp_id = %s
                 ORDER BY replace_date NULLS LAST, id
@@ -803,9 +963,9 @@ class DatabasePG:
     def get_replacements_detailed(self, grp_id: int) -> List[Tuple]:
         """Замены по ГРП с привязкой к физическому объекту.
 
-        Кортежи: (id, replace_date, part_number, equipment_type, model,
-        manufacturer, work_type, reason, supervisor, equipment_id, part_id,
-        effect, new_equipment_id, equipment_name, part_name).
+        Порядок полей — core.repair_journal.DETAILED_COLUMNS: запись целиком,
+        затем названия оборудования и запчасти и номер по схеме — из них
+        собираются графы журнала.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -813,7 +973,8 @@ class DatabasePG:
                 SELECT r.id, r.replace_date, r.part_number, r.equipment_type, r.model,
                        r.manufacturer, r.work_type, r.reason, r.supervisor,
                        r.equipment_id, r.part_id, r.effect, r.new_equipment_id,
-                       e.name, p.name
+                       r.hours_before, r.residual_after, r.document, r.note,
+                       e.name, p.name, e.scheme_number
                 FROM replacements r
                 LEFT JOIN equipment e ON e.id = r.equipment_id
                 LEFT JOIN parts p ON p.id = r.part_id
@@ -828,10 +989,19 @@ class DatabasePG:
         Возвращает описание того, что восстановлено ('' — ничего не менялось).
         """
         record = self.get_replacement(repl_id)
-        if not record or record[11] not in ('part', 'equipment'):
+        if not record:
             return ''
-        _, replace_date, _pn, _et, _model, _man, _work, _reason, _sup, \
-            equipment_id, part_id, effect, new_equipment_id = record
+        # Поля читаются по именам, а не распаковкой: строка выборки растёт
+        # (см. core.repair_journal), и числовая распаковка сломалась бы.
+        columns = repair_journal.RECORD_COLUMNS
+        row = list(record) + [None] * len(columns)
+        effect = row[columns.index('effect')]
+        if effect not in ('part', 'equipment'):
+            return ''
+        replace_date = row[columns.index('replace_date')]
+        equipment_id = row[columns.index('equipment_id')]
+        part_id = row[columns.index('part_id')]
+        new_equipment_id = row[columns.index('new_equipment_id')]
         with self.get_connection() as conn:
             cursor = conn.cursor()
             if effect == 'part' and equipment_id and part_id:
@@ -849,7 +1019,7 @@ class DatabasePG:
                                   AND removal_date::text = %s
                                 ORDER BY id DESC LIMIT 1)
                 ''', (equipment_id, part_id, replace_date))
-                return 'срок детали восстановлен'
+                return 'срок запчасти восстановлен'
             if effect == 'equipment' and equipment_id:
                 if new_equipment_id:
                     cursor.execute('DELETE FROM equipment WHERE id = %s', (new_equipment_id,))
@@ -881,3 +1051,180 @@ class DatabasePG:
                 ORDER BY manufacturer
             ''')
             return [r[0] for r in cursor.fetchall()]
+
+    # === МЕТОДЫ ДЛЯ РАБОТЫ С ОТКАЗАМИ ===
+
+    def add_failure(self, grp_id: int, fields: Dict,
+                    photo: bytes = None) -> int:
+        """Добавление записи об отказе.
+
+        fields — графы записи {ключ: значение} (см. core.failure_log.values):
+        дата выявления, тип события, причина, критичность, устранён, документ
+        и примечания. photo — снимок (или скан акта) байтами: он хранится
+        отдельной колонкой и в графы записи не входит.
+        """
+        values = dict(fields or {})
+        columns = ['grp_id'] + list(failure_log.FIELDS)
+        params = [grp_id] + [values.get(key) for key in failure_log.FIELDS]
+        if photo is not None:
+            columns.append('photo')
+            params.append(psycopg2.Binary(photo))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'INSERT INTO failures ({", ".join(columns)}) '
+                f'VALUES ({", ".join(["%s"] * len(columns))}) RETURNING id',
+                params)
+            return cursor.fetchone()[0]
+
+    def update_failure(self, failure_id: int, fields: Dict):
+        """Обновление граф записи об отказе (фото меняется отдельно).
+
+        Графы записываются как показаны в форме, поэтому пустое значение
+        стирает прежнее.
+        """
+        values = dict(fields or {})
+        assignments = ', '.join(f'{key} = %s' for key in failure_log.FIELDS)
+        params = [values.get(key) for key in failure_log.FIELDS] + [failure_id]
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'UPDATE failures SET {assignments}, '
+                f'updated_at = CURRENT_TIMESTAMP WHERE id = %s',
+                params)
+
+    def delete_failure(self, failure_id: int):
+        """Удаление записи об отказе вместе с приложенным фото."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM failures WHERE id = %s', (failure_id,))
+
+    def get_failure(self, failure_id: int) -> Optional[Tuple]:
+        """Одна запись об отказе.
+
+        Порядок полей — core.failure_log.RECORD_COLUMNS: графы записи и
+        отметка о приложенном фото (сами байты берёт get_failure_photo).
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, detected_date, event_type, reason, criticality,
+                       resolved, document, note, (photo IS NOT NULL) AS has_photo
+                FROM failures WHERE id = %s
+            ''', (failure_id,))
+            return cursor.fetchone()
+
+    def get_failures_by_grp(self, grp_id: int) -> List[Tuple]:
+        """Отказы по ГРП — свежие сверху.
+
+        Порядок полей — core.failure_log.RECORD_COLUMNS. Даты записаны
+        текстом, поэтому свежие сверху стоят по ISO-виду (его и пишет форма).
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, detected_date, event_type, reason, criticality,
+                       resolved, document, note, (photo IS NOT NULL) AS has_photo
+                FROM failures
+                WHERE grp_id = %s
+                ORDER BY detected_date DESC NULLS LAST, id DESC
+            ''', (grp_id,))
+            return cursor.fetchall()
+
+    def get_failure_photo(self, failure_id: int) -> Optional[bytes]:
+        """Фото записи об отказе байтами; None — фото не приложено."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT photo FROM failures WHERE id = %s',
+                           (failure_id,))
+            row = cursor.fetchone()
+        if not row or row[0] is None:
+            return None
+        # psycopg2 отдаёт bytea как memoryview.
+        return bytes(row[0])
+
+    def set_failure_photo(self, failure_id: int, data: bytes = None):
+        """Приложить фото к записи (data=None — убрать приложенное)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE failures SET photo = %s, updated_at = CURRENT_TIMESTAMP '
+                'WHERE id = %s',
+                (psycopg2.Binary(data) if data is not None else None,
+                 failure_id))
+
+    # === МЕТОДЫ ДЛЯ РАБОТЫ С ТЕХНИЧЕСКИМ ДИАГНОСТИРОВАНИЕМ ===
+
+    @staticmethod
+    def _diagnostic_select() -> str:
+        """Список полей выборки проверок — по описанию core.diagnostic_log.
+
+        Порядок граф берётся из описания, а не пишется в запросе: строка
+        выборки читается по RECORD_COLUMNS, и перестановка граф в описании
+        должна переносить за собой и запрос.
+        """
+        return 'id, ' + ', '.join(diagnostic_log.FIELDS)
+
+    def add_diagnostic_check(self, grp_id: int, fields: Dict) -> int:
+        """Добавление записи технического диагностирования.
+
+        fields — графы записи {ключ: значение} (см. core.diagnostic_log.values):
+        дата, оборудование, проверяемый параметр, режим, допуск мин/макс,
+        факт мин/макс, результат и примечание.
+        """
+        values = dict(fields or {})
+        columns = ['grp_id'] + list(diagnostic_log.FIELDS)
+        params = [grp_id] + [values.get(key) for key in diagnostic_log.FIELDS]
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'INSERT INTO diagnostic_checks ({", ".join(columns)}) '
+                f'VALUES ({", ".join(["%s"] * len(columns))}) RETURNING id',
+                params)
+            return cursor.fetchone()[0]
+
+    def update_diagnostic_check(self, check_id: int, fields: Dict):
+        """Обновление граф записи проверки.
+
+        Графы записываются как показаны в форме, поэтому пустое значение
+        стирает прежнее.
+        """
+        values = dict(fields or {})
+        assignments = ', '.join(f'{key} = %s' for key in diagnostic_log.FIELDS)
+        params = [values.get(key) for key in diagnostic_log.FIELDS] + [check_id]
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'UPDATE diagnostic_checks SET {assignments}, '
+                f'updated_at = CURRENT_TIMESTAMP WHERE id = %s',
+                params)
+
+    def delete_diagnostic_check(self, check_id: int):
+        """Удаление записи проверки."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM diagnostic_checks WHERE id = %s',
+                           (check_id,))
+
+    def get_diagnostic_check(self, check_id: int) -> Optional[Tuple]:
+        """Одна запись проверки; порядок полей — core.diagnostic_log.RECORD_COLUMNS."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'SELECT {self._diagnostic_select()} '
+                f'FROM diagnostic_checks WHERE id = %s', (check_id,))
+            return cursor.fetchone()
+
+    def get_diagnostic_checks(self, grp_id: int) -> List[Tuple]:
+        """Проверки по ГРП — свежие сверху.
+
+        Порядок полей — core.diagnostic_log.RECORD_COLUMNS. Даты записаны
+        текстом, поэтому свежие сверху стоят по ISO-виду (его и пишет форма).
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'SELECT {self._diagnostic_select()} FROM diagnostic_checks '
+                f'WHERE grp_id = %s '
+                f'ORDER BY check_date DESC NULLS LAST, id DESC', (grp_id,))
+            return cursor.fetchall()

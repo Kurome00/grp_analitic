@@ -10,6 +10,7 @@ from datetime import date
 from tkinter import messagebox, ttk
 
 from core.config import FULL_CHECK_TERM
+from core import diagnostic_log
 from core.lifetimes import expiry_date
 from core.timefmt import years_to_text
 from ui.window_utils import fit_window
@@ -683,10 +684,17 @@ class HorizonSlider(tk.Frame):
 
 
 class AlgorithmsWindow:
-    """Расчёт и разбор остаточного ресурса ГРП по всем алгоритмам."""
+    """Расчёт и разбор остаточного ресурса ГРП по всем алгоритмам.
+
+    Строится либо в отдельном окне (`container` не задан), либо прямо в экране
+    главного окна — так расчёт открывается из меню, как и остальные разделы.
+    `on_close` вызывается кнопкой «Закрыть»: встроенному расчёту нужно не
+    уничтожить себя, а вернуть главное окно на рабочий экран.
+    """
 
     def __init__(self, parent, db, grp_id, equipment_data, grp_name=None,
-                 params: AlgorithmParams = None, on_params=None):
+                 params: AlgorithmParams = None, on_params=None,
+                 container=None, on_close=None):
         self.parent = parent
         self.db = db
         self.grp_id = grp_id
@@ -696,31 +704,63 @@ class AlgorithmsWindow:
         # главное окно запоминает их, чтобы Word-отчёт считался с теми же
         # значениями, что показаны здесь.
         self._on_params = on_params
+        self._on_close = on_close
         self.params = copy.deepcopy(params) if params else AlgorithmParams()
         self.results = {}
         self.warnings = []
         self.journal = {}
+        self._closed = False
 
         # Таблицы рисуются темой clam: тема Windows не даёт задать им цвет.
         # Тема в интерпретаторе общая, поэтому её нужно вернуть при выходе —
         # иначе главное окно останется в чужом оформлении.
         self._theme_saved = calc_theme()
 
-        self.window = tk.Toplevel(parent)
-        self.window.title(f'Остаточный ресурс · {self.grp_name}')
-        self.window.configure(bg=BG)
-        self.window.transient(parent)
-        self.window.grab_set()
-        self.window.bind('<Destroy>', self._on_destroy, add='+')
+        self._toplevel = container is None
+        if self._toplevel:
+            self.window = tk.Toplevel(parent)
+            self.window.title(f'Остаточный ресурс · {self.grp_name}')
+            self.window.configure(bg=BG)
+            self.window.transient(parent)
+            self.window.grab_set()
+            self.window.bind('<Destroy>', self._on_destroy, add='+')
+        else:
+            self.window = container
+            try:
+                self.window.configure(bg=BG)
+            except tk.TclError:
+                # Контейнер ttk не знает опции -bg: фон задаёт сам экран.
+                pass
 
         self._build_ui()
         self.calculate_and_display()
-        # Окно по содержимому: широкие таблицы требуют места, но на ноутбуке
-        # 1560x900 не влезало — размер считается от запроса виджетов и экрана.
-        fit_window(self.window, min_width=900, min_height=560)
+        if self._toplevel:
+            # Окно по содержимому: широкие таблицы требуют места, но на ноутбуке
+            # 1560x900 не влезало — размер считается от запроса виджетов и экрана.
+            fit_window(self.window, min_width=900, min_height=560)
 
-    def _on_destroy(self, _event=None):
+    def _on_destroy(self, event=None):
+        # <Destroy> прилетает и от дочерних виджетов: реакция нужна только на
+        # закрытие самого окна.
+        if event is not None and event.widget is not self.window:
+            return
+        self.close()
+
+    def close(self):
+        """Вернуть тему ttk. Для отдельного окна — закрыть его."""
+        if self._closed:
+            return
+        self._closed = True
         restore_theme(self._theme_saved)
+        if self._toplevel:
+            self.window.destroy()
+
+    def _close_requested(self):
+        """Кнопка «Закрыть»: встроенный расчёт уступает место рабочему экрану."""
+        if self._on_close is not None:
+            self._on_close()
+        elif self._toplevel:
+            self.window.destroy()
 
     # ------------------------------------------------------------------ UI
 
@@ -771,7 +811,7 @@ class AlgorithmsWindow:
         right.pack(side=tk.RIGHT)
         _btn(right, 'Пересчитать', self.calculate_and_display,
              color='success').pack(side=tk.RIGHT, padx=(8, 0))
-        _btn(right, 'Закрыть', self.window.destroy, color='muted').pack(side=tk.RIGHT)
+        _btn(right, 'Закрыть', self._close_requested, color='muted').pack(side=tk.RIGHT)
 
     def _algo_choices(self):
         """Подписи методик для выпадающих списков: пять штук, номера 1-5."""
@@ -1751,12 +1791,14 @@ justify=tk.LEFT, wraplength=1400)
     def _collect_input(self, coefficients):
         """Готовит вход для расчёта и список замечаний по данным."""
         journal = self._load_journal()
+        checks = self._load_checks()
         grp_renewed = _last_replacement_on(journal)
         payload, warnings = [], []
 
         for row in self.equipment_data:
             equip = self._row_to_dict(row)
             equip['details'] = self._load_details(equip, warnings)
+            equip['state_params'] = self._load_state_params(equip, checks)
             record = self._match_journal(equip, journal)
             if record:
                 equip['failures'] = record['fail']
@@ -1787,6 +1829,16 @@ justify=tk.LEFT, wraplength=1400)
             warnings.append(
                 f'Журнал технической диагностики пуст: в {algo_label(1)} общий '
                 'коэффициент Kобщ = 1, оценка получается завышенной.')
+        counted = [e for e in payload if e.get('state_params')]
+        if not checks:
+            warnings.append(
+                'Проверок технического диагностирования нет: K_сост = 1 для всех '
+                'элементов (вкладка «Техническое диагностирование»).')
+        elif not counted:
+            warnings.append(
+                'Проверки технического диагностирования не сопоставлены ни с одним '
+                'элементом: оборудование в протоколах должно называться так же, как '
+                'в справочнике (регулятор, ПЗК, ПСК, фильтр, краны) — иначе K_сост = 1.')
         if not journal:
             warnings.append(
                 'Журнал замен пуст: Nотказ = 0 и Nповрежд = 0, поэтому kповр = 1 для '
@@ -1806,6 +1858,51 @@ justify=tk.LEFT, wraplength=1400)
                 f'дата последней замены по ГРП ({grp_renewed}). Укажите дату в '
                 f'вкладке «Запчасти», если запчасть менялась отдельно.')
         return payload, warnings, journal
+
+    def _load_checks(self):
+        """Проверки технического диагностирования ГРП для K_сост."""
+        try:
+            rows = self.db.get_diagnostic_checks(self.grp_id) or []
+        except Exception:  # noqa: BLE001 — без проверок K_сост = 1
+            return []
+        return [diagnostic_log.form_values(row) for row in rows]
+
+    def _load_state_params(self, equip, checks):
+        """Проверки этого элемента — вход K_сост (шаг 3 расчёта).
+
+        Протокол называет оборудование коротко («Регулятор», «ПЗК», «Кран на
+        входе»), а единица в базе — подробно («Клапан предохранительный
+        запорный ПКН-50»), поэтому сопоставление идёт по отнесению к
+        критическому элементу: тем же признаком элемент опознан и в расчёте.
+
+        Каждая строка протокола даёт до двух проверок — по факту минимума и по
+        факту максимума: в расчётном файле паспорта 10 строк регулятора
+        считаются как 20 проверок. Строка без фактического значения (в
+        протоколе — «герметичность», «норма» словами) проверок не даёт;
+        отклонение считается от режима проверки, поэтому строка без режима
+        отмечается как непригодная.
+        """
+        key = classify_critical(equip.get('name') or '')
+        if not key:
+            return []
+        params = []
+        for row in checks:
+            if classify_critical(row.get('equipment') or '') != key:
+                continue
+            date = diagnostic_log.date_text(row.get('check_date'))
+            parameter = row.get('parameter') or 'Параметр'
+            for fact_key, side in (('fact_min', 'мин'), ('fact_max', 'макс')):
+                actual = diagnostic_log.to_number(row.get(fact_key))
+                if actual is None:
+                    continue
+                params.append({
+                    'name': f'{date} {parameter} ({side})',
+                    'nominal': diagnostic_log.to_number(row.get('mode')),
+                    'actual': actual,
+                    'tol_min': diagnostic_log.to_number(row.get('tolerance_min')),
+                    'tol_max': diagnostic_log.to_number(row.get('tolerance_max')),
+                })
+        return params
 
     def _load_details(self, equip, warnings):
         """Активные запчасти элемента для варианта Б2 базового ресурса."""
